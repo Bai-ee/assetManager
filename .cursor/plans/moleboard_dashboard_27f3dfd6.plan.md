@@ -4,40 +4,40 @@ overview: Local-only Next.js dashboard wrapping Mole CLI with scanner, runner, a
 todos:
   - id: scaffold-app
     content: Scaffold Next.js with Tailwind/shadcn/Square UI
-    status: in_progress
+    status: completed
   - id: layout-nav
     content: Create layout shell with nav for all views
-    status: pending
+    status: completed
   - id: runner-api
     content: Add Mole runner API with SSE and history
-    status: pending
+    status: completed
   - id: scanner-service
     content: Implement scanner+watch+cache and scan APIs
-    status: pending
+    status: completed
   - id: file-ops
     content: Add archive/move/delete/reveal endpoints
-    status: pending
+    status: completed
   - id: pages-dashboard
     content: Build dashboard KPIs, charts, largest lists
-    status: pending
+    status: completed
   - id: pages-files
     content: Build file explorer with filters/offenders
-    status: pending
+    status: completed
   - id: pages-actions
     content: Build Mole actions UI with logs and fallback
-    status: pending
+    status: completed
   - id: pages-organize
     content: Build organize flow with rename/move plan
-    status: pending
+    status: completed
   - id: content-id
     content: Implement Content ID indexer/analyzers/search UI
-    status: pending
+    status: completed
   - id: storage-history
     content: Add disk history tracker for trend chart
-    status: pending
+    status: completed
   - id: testing-pass
     content: Manual smoke tests and lint/type fixes
-    status: pending
+    status: in_progress
 ---
 
 # MoleBoard Build Plan
