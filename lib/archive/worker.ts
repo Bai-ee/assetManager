@@ -23,7 +23,23 @@ async function* walk(root: string, current = root): AsyncGenerator<string> {
 }
 
 export class ArchiveWorker {
+  private pauseRequested = new Set<string>();
   constructor(private store = new ArchiveDatabase()) {}
+
+  pause(jobId: string): void {
+    const job = this.store.getJob(jobId);
+    if (!job) throw new Error('Unknown job');
+    this.pauseRequested.add(jobId);
+    this.store.setJobState(jobId, 'PAUSED');
+  }
+
+  resume(jobId: string): Promise<CollectionJobRecord> {
+    const job = this.store.getJob(jobId);
+    if (!job) throw new Error('Unknown job');
+    if (job.state !== 'PAUSED' && job.state !== 'FAILED') throw new Error('Job is not resumable');
+    this.pauseRequested.delete(jobId);
+    return this.run(jobId);
+  }
 
   async registerSource(label: string, rootPath: string): Promise<ArchiveSource> {
     const resolved = path.resolve(rootPath);
@@ -57,7 +73,16 @@ export class ArchiveWorker {
 
     this.store.setJobState(jobId, 'RUNNING');
 
+    try {
+      await fs.access(selectedRoot);
+    } catch {
+      this.store.upsertSource({ ...source, state: 'OFFLINE', lastSeenAt: source.lastSeenAt });
+      this.store.setJobState(jobId, 'PAUSED');
+      return this.store.getJob(jobId)!;
+    }
+
     for await (const fullPath of walk(selectedRoot)) {
+      if (this.pauseRequested.has(jobId)) return this.store.getJob(jobId)!;
       const relativePath = path.relative(source.rootPath, fullPath);
       const id = locationId(source.id, relativePath);
       try {
@@ -98,6 +123,16 @@ export class ArchiveWorker {
         if (current) this.store.upsertLocation({ ...current, state: 'RETRYABLE_FAILED', error: error instanceof Error ? error.message : String(error) });
         this.store.bumpJob(jobId, 'failed');
       }
+    }
+
+    // A disconnected NAS can make traversal end early. Verify source still exists
+    // before ever marking the collection complete.
+    try {
+      await fs.access(selectedRoot);
+    } catch {
+      this.store.upsertSource({ ...source, state: 'OFFLINE', lastSeenAt: source.lastSeenAt });
+      this.store.setJobState(jobId, 'PAUSED');
+      return this.store.getJob(jobId)!;
     }
 
     this.store.setJobState(jobId, 'COMPLETE');
