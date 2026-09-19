@@ -1,5 +1,7 @@
 # HITLOOP Archive POC — Implementation Plan
 
+> **Agent note (2026-09-19):** Phases below describe the dependency model, not current completion. Several later-phase seams have already been implemented in parallel. Read `CURRENT_STATE.md` before starting work to see what exists now and what remains unverified.
+
 The build is deliberately resumable for both data processing and agent development. Each phase has an explicit contract and acceptance gate. Do not start dependent work by guessing an unfinished contract.
 
 ## Phase 0 — Baseline and discovery
@@ -115,7 +117,7 @@ Gate: a non-developer can run a test collection from selection through approval 
 
 Owner: Arweave agent.
 
-FIRST reuse/port established Arweave upload and cost-estimation code found in Bryan's repositories.
+Reuse/port the established Arweave implementation recovered in `Bai-ee/arweave-video-generator` and referenced by HITLOOP's Underground Existence / EditVideos bridge. The POC now uses `@ardrive/turbo-sdk`; large originals upload from the NAS worker, not Vercel. The recovered cost calculator is a legacy estimate only and must remain labeled as such until a current live Turbo quote path is verified.
 
 Deliver:
 - package builder
