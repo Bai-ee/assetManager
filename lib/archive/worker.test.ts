@@ -12,7 +12,7 @@ async function fixture() {
   const sourceRoot = path.join(dir, 'nas');
   await fs.mkdir(sourceRoot);
   const db = new ArchiveDatabase(dbPath);
-  return { dir, dbPath, sourceRoot, db, worker: new ArchiveWorker(db) };
+  return { dir, dbPath, sourceRoot, db, worker: new ArchiveWorker(db, { stableFileDwellMs: 0, heartbeatEveryFiles: 1 }) };
 }
 
 test('deduplicates identical bytes while preserving both locations', async () => {
@@ -76,6 +76,37 @@ test('rejects selected folder escaping registered source', async () => {
   const source = await f.worker.registerSource('test', f.sourceRoot);
   const job = f.worker.createJob(source.id, '../outside');
   await assert.rejects(() => f.worker.run(job.id), /escapes source root/);
+  f.db.close();
+  await fs.rm(f.dir, {recursive:true,force:true});
+});
+
+
+test('emits heartbeats while processing a collection', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'a.txt'), 'hello');
+  const beats: string[] = [];
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0, heartbeatEveryFiles: 1, onHeartbeat: h => beats.push(h.jobId) });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  const job = worker.createJob(source.id);
+  await worker.run(job.id);
+  assert.ok(beats.length >= 1);
+  assert.ok(beats.every(id => id === job.id));
+  f.db.close();
+  await fs.rm(f.dir, {recursive:true,force:true});
+});
+
+test('unstable files are retryable instead of archived', async () => {
+  const f = await fixture();
+  const file = path.join(f.sourceRoot, 'moving.txt');
+  await fs.writeFile(file, 'one');
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 50 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  const job = worker.createJob(source.id);
+  setTimeout(() => { void fs.appendFile(file, ' changed'); }, 10);
+  const done = await worker.run(job.id);
+  assert.equal(done.counters.failed, 1);
+  const row = f.db.db.prepare("SELECT state FROM file_locations WHERE relative_path='moving.txt'").get() as {state:string};
+  assert.equal(row.state, 'RETRYABLE_FAILED');
   f.db.close();
   await fs.rm(f.dir, {recursive:true,force:true});
 });
