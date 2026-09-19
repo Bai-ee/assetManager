@@ -31,3 +31,20 @@ export class ControlPlaneClient {
     if (!response.ok) throw new Error(`HITLOOP heartbeat failed: ${response.status}`);
   }
 }
+
+
+export interface ArchiveCommand {
+  id: string;
+  type: 'PROCESS_COLLECTION';
+  workerId: string;
+  sourceId: string;
+  relativePath: string;
+  state: 'QUEUED';
+}
+
+export interface CommandUpdate {
+  commandId: string;
+  state: 'CLAIMED' | 'RUNNING' | 'COMPLETE' | 'FAILED';
+  jobId?: string | null;
+  error?: string | null;
+}
