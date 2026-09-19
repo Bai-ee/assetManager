@@ -1,5 +1,7 @@
 import { createHash } from 'crypto';
 import { hostname } from 'os';
+import { promises as fs } from 'fs';
+import path from 'path';
 import { ArchiveDatabase } from './database';
 import { ArchiveWorker } from './worker';
 import { ControlPlaneClient, type ArchiveCommand } from './control-plane';
@@ -24,6 +26,17 @@ export class ArchiveDaemon {
     await this.control.updateCommand({ commandId: command.id, state: 'CLAIMED' });
     const source = this.db.getSource(command.sourceId);
     if (!source) throw new Error(`Unknown source ${command.sourceId}`);
+
+    if (command.type === 'LIST_DIRECTORY') {
+      const root = path.resolve(source.rootPath);
+      const target = path.resolve(root, command.relativePath || '.');
+      const relative = path.relative(root, target);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Directory escapes registered source');
+      const entries = await fs.readdir(target, { withFileTypes:true });
+      const folders = entries.filter(e=>e.isDirectory() && !e.name.startsWith('.')).map(e=>e.name).sort((a,b)=>a.localeCompare(b));
+      await this.control.updateCommand({ commandId:command.id, state:'COMPLETE', result:{relativePath:relative || '.', folders} });
+      return;
+    }
 
     const worker = new ArchiveWorker(this.db, {
       onHeartbeat: async h => {
