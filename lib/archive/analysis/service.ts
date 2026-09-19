@@ -9,6 +9,26 @@ function observationId(assetId:string,provider:string,kind:string){
 export class ArchiveAnalysisService {
   constructor(private db=new ArchiveDatabase(),private twelveLabs=new TwelveLabsAdapter()) {}
 
+  async advanceVideo(contentAssetId:string) {
+    const obs=this.db.listObservations(contentAssetId).find(x=>x.provider==='twelvelabs'&&x.kind==='video_understanding');
+    if(!obs?.providerAssetId) return obs || null;
+    const asset=await this.twelveLabs.getAsset(obs.providerAssetId);
+    const status=String(asset.status||'').toLowerCase();
+    if(status==='failed') {
+      this.db.upsertObservation({...obs,status:'FAILED',payload:asset,error:'TwelveLabs asset processing failed'});
+      this.db.setAssetState(contentAssetId,'RETRYABLE_FAILED'); return this.db.listObservations(contentAssetId).find(x=>x.id===obs.id)!;
+    }
+    if(status!=='ready') {
+      this.db.upsertObservation({...obs,status:'INDEXING',payload:asset}); return this.db.listObservations(contentAssetId).find(x=>x.id===obs.id)!;
+    }
+    if(obs.status!=='INDEXING') {
+      const indexed=await this.twelveLabs.indexAsset(obs.providerAssetId);
+      this.db.upsertObservation({...obs,status:'INDEXING',payload:{asset,indexed}});
+      return this.db.listObservations(contentAssetId).find(x=>x.id===obs.id)!;
+    }
+    return obs;
+  }
+
   async analyzeVideo(contentAssetId:string,filePath:string) {
     if(!isTwelveLabsVideo(filePath)) return null;
     const id=observationId(contentAssetId,'twelvelabs','video_understanding');
