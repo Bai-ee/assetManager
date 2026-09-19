@@ -57,6 +57,21 @@ export class ArchiveDaemon {
   }
 
   async run(pollMs = 5000) {
+    // Restart recovery is local-first. Jobs that were RUNNING are converted to
+    // PAUSED by ArchiveDatabase on open; resume them before accepting new work.
+    for (const job of this.db.listResumableJobs()) {
+      try {
+        const source=this.db.getSource(job.sourceId);
+        if(!source) continue;
+        const worker=new ArchiveWorker(this.db,{onHeartbeat: async h => {
+          const current=this.db.getJob(h.jobId);
+          try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:h.jobId,state:'PROCESSING',at:h.at,counters:current?.counters}); } catch {}
+        }});
+        const result=await worker.resume(job.id);
+        try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:job.id,state:result.state==='COMPLETE'?'ONLINE':'PAUSED',at:new Date().toISOString(),counters:result.counters}); } catch {}
+      } catch { /* leave durable job for next restart/manual intervention */ }
+    }
+
     // Publish every locally registered source without revealing its filesystem path.
     if (this.control.configured) {
       for (const source of this.db.listSources()) {
