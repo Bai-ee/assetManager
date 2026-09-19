@@ -9,10 +9,15 @@ export interface WorkerHeartbeat {
 
 export interface ArchiveCommand {
   id: string;
-  type: 'PROCESS_COLLECTION' | 'LIST_DIRECTORY';
+  type: 'PROCESS_COLLECTION' | 'LIST_DIRECTORY' | 'UPLOAD_ASSET_ARWEAVE';
   workerId: string;
   sourceId: string;
   relativePath: string;
+  contentAssetId?: string;
+  collectionId?: string;
+  archiveName?: string;
+  contentType?: string;
+  expectedSha256?: string;
   state: 'QUEUED';
 }
 
