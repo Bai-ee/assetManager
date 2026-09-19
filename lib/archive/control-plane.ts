@@ -35,7 +35,7 @@ export class ControlPlaneClient {
 
 export interface ArchiveCommand {
   id: string;
-  type: 'PROCESS_COLLECTION';
+  type: 'PROCESS_COLLECTION' | 'LIST_DIRECTORY';
   workerId: string;
   sourceId: string;
   relativePath: string;
@@ -47,4 +47,5 @@ export interface CommandUpdate {
   state: 'CLAIMED' | 'RUNNING' | 'COMPLETE' | 'FAILED';
   jobId?: string | null;
   error?: string | null;
+  result?: unknown;
 }
