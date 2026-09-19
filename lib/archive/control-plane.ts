@@ -73,4 +73,29 @@ export class ControlPlaneClient {
     });
     if(!response.ok) throw new Error(`HITLOOP command update failed: ${response.status}`);
   }
+  async syncAsset(payload: {
+    workerId: string;
+    sourceId: string;
+    collectionJobId?: string;
+    asset: {
+      id: string;
+      sha256: string;
+      mediaType?: string;
+      sizeBytes?: number;
+      archiveName?: string;
+      sourcePaths?: string[];
+      observations?: unknown[];
+      decisions?: unknown[];
+      state?: string;
+    };
+  }): Promise<void> {
+    if (!this.configured) return;
+    const response = await fetch(`${this.baseUrl}/api/archive/worker/assets`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error(`Asset sync failed: ${response.status} ${await response.text()}`);
+  }
+
 }
