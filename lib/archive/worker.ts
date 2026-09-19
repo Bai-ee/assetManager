@@ -12,8 +12,7 @@ function locationId(sourceId: string, relativePath: string): string {
 }
 
 async function* walk(root: string, current = root): AsyncGenerator<string> {
-  let dir;
-  try { dir = await fs.opendir(current); } catch { return; }
+  const dir = await fs.opendir(current);
   for await (const entry of dir) {
     if (SKIP.has(entry.name)) continue;
     const full = path.join(current, entry.name);
@@ -98,8 +97,12 @@ export class ArchiveWorker {
     const source = this.store.getSource(job.sourceId);
     if (!source) throw new Error('Unknown source');
 
-    const selectedRoot = path.resolve(source.rootPath, job.selectedRelativePath);
-    if (!selectedRoot.startsWith(source.rootPath)) throw new Error('Selected path escapes source root');
+    const sourceRoot = path.resolve(source.rootPath);
+    const selectedRoot = path.resolve(sourceRoot, job.selectedRelativePath);
+    const selectedRelative = path.relative(sourceRoot, selectedRoot);
+    if (selectedRelative.startsWith('..') || path.isAbsolute(selectedRelative)) {
+      throw new Error('Selected path escapes source root');
+    }
 
     this.store.setJobState(jobId, 'RUNNING');
 
@@ -113,6 +116,7 @@ export class ArchiveWorker {
 
     let processedSinceHeartbeat = 0;
     this.heartbeat(jobId, source.id);
+    try {
     for await (const fullPath of walk(selectedRoot)) {
       if (this.pauseRequested.has(jobId)) return this.store.getJob(jobId)!;
       processedSinceHeartbeat++;
@@ -160,6 +164,15 @@ export class ArchiveWorker {
         if (current) this.store.upsertLocation({ ...current, state: 'RETRYABLE_FAILED', error: error instanceof Error ? error.message : String(error) });
         this.store.bumpJob(jobId, 'failed');
       }
+    }
+
+    }
+    } catch (error) {
+      // Traversal failures are not completion. A disconnected/unreadable subtree must
+      // leave a resumable job rather than silently losing files.
+      this.store.setJobState(jobId, 'PAUSED');
+      this.store.upsertSource({ ...source, state: 'OFFLINE', lastSeenAt: source.lastSeenAt });
+      return this.store.getJob(jobId)!;
     }
 
     // A disconnected NAS can make traversal end early. Verify source still exists
