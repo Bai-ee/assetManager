@@ -69,6 +69,11 @@ export class ArchiveDatabase {
       ON CONFLICT(id) DO UPDATE SET label=excluded.label, root_path=excluded.root_path, state=excluded.state, last_seen_at=excluded.last_seen_at`).run(s);
   }
 
+  listSources(): ArchiveSource[] {
+    const rows:any[] = this.db.prepare('SELECT * FROM sources ORDER BY label').all();
+    return rows.map(r => ({id:r.id,label:r.label,rootPath:r.root_path,state:r.state,createdAt:r.created_at,lastSeenAt:r.last_seen_at}));
+  }
+
   getSource(id: string): ArchiveSource | undefined {
     const r:any=this.db.prepare('SELECT * FROM sources WHERE id=?').get(id); if(!r)return;
     return {id:r.id,label:r.label,rootPath:r.root_path,state:r.state,createdAt:r.created_at,lastSeenAt:r.last_seen_at};
