@@ -51,13 +51,17 @@ export class ArchiveDatabase {
 
   close() { this.db.close(); }
 
+  listResumableJobs(): CollectionJobRecord[] {
+    return [...this.listJobsByState('PAUSED'), ...this.listJobsByState('FAILED')];
+  }
+
   listJobsByState(state: CollectionJobRecord['state']): CollectionJobRecord[] {
     return (this.db.prepare('SELECT id FROM collection_jobs WHERE state=?').all(state) as Array<{id:string}>)
       .map(r => this.getJob(r.id)!)
       .filter(Boolean);
   }
 
-  private recoverInterruptedJobs() {
+  recoverInterruptedJobs() {
     this.db.prepare("UPDATE collection_jobs SET state='PAUSED', updated_at=? WHERE state='RUNNING'")
       .run(new Date().toISOString());
     this.db.prepare("UPDATE file_locations SET state='RETRYABLE_FAILED', error=COALESCE(error, 'Worker interrupted') WHERE state IN ('HASHING','ANALYZING','UPLOADING')")
