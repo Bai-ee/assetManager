@@ -2,7 +2,7 @@
 
 Updated: 2026-09-19
 
-CURRENT PHASE: Phase 0 — Baseline and discovery
+CURRENT PHASE: Phase 1 — NAS foundation
 STATUS: IN PROGRESS
 
 ## Confirmed
@@ -43,3 +43,23 @@ STATUS: IN PROGRESS
 
 ## Last verified branch
 feat/archive-master-plan
+
+
+## 2026-09-19 Phase 1 implementation checkpoint
+Implemented:
+- lib/archive/types.ts processing/job/source/location/content contracts
+- lib/archive/hash.ts streaming SHA-256 over actual file bytes
+- lib/archive/manifest.ts atomic durable manifest checkpointing
+- lib/archive/worker.ts incremental async directory traversal, source registration, selected-folder jobs, exact hash dedupe, unchanged-file skipping, retryable file failures, file-change-during-hash protection
+- lib/archive/cli.ts worker CLI
+- npm script: archive:scan
+- Existing NAS originals remain read-only.
+
+Important: JSON manifest is an executable first checkpoint, not the final scale persistence layer. SQLite migration remains required before declaring Phase 1 complete.
+
+Next exact tasks:
+1. Add SQLite-backed ManifestStore and migration/bootstrap schema.
+2. Add explicit pause/resume and interrupted RUNNING-job recovery.
+3. Add source-offline detection rather than allowing a disconnected walk to look complete.
+4. Add tests for duplicate paths, changed files, restart recovery, traversal escape, and source disconnect.
+5. Run TypeScript/build validation.
