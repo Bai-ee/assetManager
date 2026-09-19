@@ -44,6 +44,13 @@ export class ArchiveDaemon {
   }
 
   async run(pollMs = 5000) {
+    // Publish every locally registered source without revealing its filesystem path.
+    if (this.control.configured) {
+      for (const source of this.db.listSources()) {
+        try { await this.control.registerSource({ workerId:this.workerId, sourceId:source.id, label:source.label, state:source.state }); }
+        catch { /* retry naturally on daemon restart; processing remains local-first */ }
+      }
+    }
     while (!this.stopped) {
       try {
         const commands = await this.control.pollCommands(this.workerId);
