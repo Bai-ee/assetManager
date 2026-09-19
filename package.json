@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "scan": "tsx lib/scanner/cli.ts",
-    "archive:scan": "tsx lib/archive/cli.ts"
+    "archive:scan": "tsx lib/archive/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test:archive": "tsx --test lib/archive/*.test.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
