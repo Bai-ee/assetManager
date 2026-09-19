@@ -24,6 +24,20 @@ export class ArchiveDaemon {
 
   stop() { this.stopped = true; }
 
+  private async syncJobAssets(sourceId:string,jobId:string) {
+    const job=this.db.getJob(jobId); if(!job) return;
+    const prefix=job.selectedRelativePath==='.'?'':job.selectedRelativePath.replace(/\/$/,'')+'/';
+    const seen=new Set<string>();
+    for(const location of this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path LIKE ?').all(sourceId,`${prefix}%`) as Array<{content_asset_id:string}>){
+      if(seen.has(location.content_asset_id)) continue; seen.add(location.content_asset_id);
+      const asset=this.db.getAsset(location.content_asset_id); if(!asset) continue;
+      const locations=this.db.listAssetLocations(asset.id).filter(x=>x.sourceId===sourceId);
+      const observations=this.db.listObservations(asset.id);
+      const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:(d.confidence??0)>0.90?'AUTO_CONFIRM':(d.confidence??0)>=0.60?'QUICK_REVIEW':'IDENTIFICATION_REQUIRED'}));
+      try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId:jobId,asset:{id:asset.id,sha256:asset.sha256,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
+    }
+  }
+
   private async execute(command: ArchiveCommand) {
     await this.control.updateCommand({ commandId: command.id, state: 'CLAIMED' });
     const source = this.db.getSource(command.sourceId);
@@ -70,6 +84,7 @@ export class ArchiveDaemon {
     const job = worker.createJob(command.sourceId, command.relativePath);
     await this.control.updateCommand({ commandId: command.id, state: 'RUNNING', jobId: job.id });
     const result = await worker.run(job.id);
+    await this.syncJobAssets(command.sourceId,job.id);
     const state = result.state === 'COMPLETE' ? 'COMPLETE' : 'FAILED';
     await this.control.updateCommand({ commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null });
   }
@@ -86,6 +101,7 @@ export class ArchiveDaemon {
           try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:h.jobId,state:'PROCESSING',at:h.at,counters:current?.counters}); } catch {}
         }});
         const result=await worker.resume(job.id);
+        await this.syncJobAssets(job.sourceId,job.id);
         try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:job.id,state:result.state==='COMPLETE'?'ONLINE':'PAUSED',at:new Date().toISOString(),counters:result.counters}); } catch {}
       } catch { /* leave durable job for next restart/manual intervention */ }
     }
