@@ -46,6 +46,15 @@ export class ArchiveDatabase {
       CREATE INDEX IF NOT EXISTS idx_locations_asset ON file_locations(content_asset_id);
       CREATE INDEX IF NOT EXISTS idx_locations_state ON file_locations(state);
       CREATE INDEX IF NOT EXISTS idx_jobs_state ON collection_jobs(state);
+      CREATE TABLE IF NOT EXISTS observations (
+        id TEXT PRIMARY KEY, content_asset_id TEXT NOT NULL, provider TEXT NOT NULL,
+        provider_asset_id TEXT, kind TEXT NOT NULL, status TEXT NOT NULL,
+        summary TEXT, payload_json TEXT, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY(content_asset_id) REFERENCES content_assets(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(content_asset_id);
+      CREATE INDEX IF NOT EXISTS idx_observations_status ON observations(status);
     `);
   }
 
@@ -115,6 +124,25 @@ export class ArchiveDatabase {
       ON CONFLICT(id) DO UPDATE SET size_bytes=excluded.size_bytes, modified_at_ms=excluded.modified_at_ms,
       last_seen_at=excluded.last_seen_at, state=excluded.state, content_asset_id=excluded.content_asset_id, error=excluded.error`)
       .run({...x,contentAssetId:x.contentAssetId??null,error:x.error??null});
+  }
+
+  upsertObservation(x:{id:string;contentAssetId:string;provider:string;providerAssetId?:string;kind:string;status:string;summary?:string;payload?:unknown;error?:string}) {
+    const now=new Date().toISOString();
+    this.db.prepare(`INSERT INTO observations
+      (id,content_asset_id,provider,provider_asset_id,kind,status,summary,payload_json,error,created_at,updated_at)
+      VALUES (@id,@contentAssetId,@provider,@providerAssetId,@kind,@status,@summary,@payloadJson,@error,@createdAt,@updatedAt)
+      ON CONFLICT(id) DO UPDATE SET provider_asset_id=excluded.provider_asset_id,status=excluded.status,
+      summary=excluded.summary,payload_json=excluded.payload_json,error=excluded.error,updated_at=excluded.updated_at`)
+      .run({...x,providerAssetId:x.providerAssetId??null,summary:x.summary??null,payloadJson:x.payload===undefined?null:JSON.stringify(x.payload),error:x.error??null,createdAt:now,updatedAt:now});
+  }
+
+  listObservations(contentAssetId:string) {
+    const rows:any[]=this.db.prepare('SELECT * FROM observations WHERE content_asset_id=? ORDER BY created_at').all(contentAssetId);
+    return rows.map(r=>({id:r.id,contentAssetId:r.content_asset_id,provider:r.provider,providerAssetId:r.provider_asset_id||undefined,kind:r.kind,status:r.status,summary:r.summary||undefined,payload:r.payload_json?JSON.parse(r.payload_json):undefined,error:r.error||undefined,createdAt:r.created_at,updatedAt:r.updated_at}));
+  }
+
+  setAssetState(id:string,state:ContentAssetRecord['state']) {
+    this.db.prepare('UPDATE content_assets SET state=? WHERE id=?').run(state,id);
   }
 
   findAssetByHash(hash:string):ContentAssetRecord|undefined {
