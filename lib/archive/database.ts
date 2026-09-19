@@ -55,6 +55,15 @@ export class ArchiveDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_observations_asset ON observations(content_asset_id);
       CREATE INDEX IF NOT EXISTS idx_observations_status ON observations(status);
+      CREATE TABLE IF NOT EXISTS jev_decisions (
+        id TEXT PRIMARY KEY, content_asset_id TEXT NOT NULL, question TEXT NOT NULL,
+        choices_json TEXT NOT NULL, selected_value TEXT, confidence REAL,
+        status TEXT NOT NULL, evidence_json TEXT, human_value TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY(content_asset_id) REFERENCES content_assets(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_jev_asset ON jev_decisions(content_asset_id);
+      CREATE INDEX IF NOT EXISTS idx_jev_status ON jev_decisions(status);
     `);
   }
 
@@ -139,6 +148,21 @@ export class ArchiveDatabase {
   listObservations(contentAssetId:string) {
     const rows:any[]=this.db.prepare('SELECT * FROM observations WHERE content_asset_id=? ORDER BY created_at').all(contentAssetId);
     return rows.map(r=>({id:r.id,contentAssetId:r.content_asset_id,provider:r.provider,providerAssetId:r.provider_asset_id||undefined,kind:r.kind,status:r.status,summary:r.summary||undefined,payload:r.payload_json?JSON.parse(r.payload_json):undefined,error:r.error||undefined,createdAt:r.created_at,updatedAt:r.updated_at}));
+  }
+
+  upsertJevDecision(x:{id:string;contentAssetId:string;question:string;choices:Array<{value:string;probability:number}>;selectedValue?:string;confidence?:number;status:string;evidence?:unknown;humanValue?:string}) {
+    const now=new Date().toISOString();
+    this.db.prepare(`INSERT INTO jev_decisions
+      (id,content_asset_id,question,choices_json,selected_value,confidence,status,evidence_json,human_value,created_at,updated_at)
+      VALUES (@id,@contentAssetId,@question,@choicesJson,@selectedValue,@confidence,@status,@evidenceJson,@humanValue,@createdAt,@updatedAt)
+      ON CONFLICT(id) DO UPDATE SET choices_json=excluded.choices_json,selected_value=excluded.selected_value,
+      confidence=excluded.confidence,status=excluded.status,evidence_json=excluded.evidence_json,human_value=excluded.human_value,updated_at=excluded.updated_at`)
+      .run({...x,choicesJson:JSON.stringify(x.choices),selectedValue:x.selectedValue??null,confidence:x.confidence??null,evidenceJson:x.evidence===undefined?null:JSON.stringify(x.evidence),humanValue:x.humanValue??null,createdAt:now,updatedAt:now});
+  }
+
+  listJevDecisions(contentAssetId:string) {
+    const rows:any[]=this.db.prepare('SELECT * FROM jev_decisions WHERE content_asset_id=? ORDER BY created_at').all(contentAssetId);
+    return rows.map(r=>({id:r.id,contentAssetId:r.content_asset_id,question:r.question,choices:JSON.parse(r.choices_json),selectedValue:r.selected_value||undefined,confidence:r.confidence??undefined,status:r.status,evidence:r.evidence_json?JSON.parse(r.evidence_json):undefined,humanValue:r.human_value||undefined,createdAt:r.created_at,updatedAt:r.updated_at}));
   }
 
   setAssetState(id:string,state:ContentAssetRecord['state']) {
