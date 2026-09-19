@@ -165,6 +165,16 @@ export class ArchiveDatabase {
     return rows.map(r=>({id:r.id,contentAssetId:r.content_asset_id,question:r.question,choices:JSON.parse(r.choices_json),selectedValue:r.selected_value||undefined,confidence:r.confidence??undefined,status:r.status,evidence:r.evidence_json?JSON.parse(r.evidence_json):undefined,humanValue:r.human_value||undefined,createdAt:r.created_at,updatedAt:r.updated_at}));
   }
 
+  getAsset(id:string):ContentAssetRecord|undefined {
+    const r:any=this.db.prepare('SELECT * FROM content_assets WHERE id=?').get(id); if(!r)return;
+    return {id:r.id,sha256:r.sha256,sizeBytes:r.size_bytes,createdAt:r.created_at,state:r.state};
+  }
+
+  listAssetLocations(contentAssetId:string):FileLocationRecord[] {
+    const rows:any[]=this.db.prepare('SELECT * FROM file_locations WHERE content_asset_id=? ORDER BY relative_path').all(contentAssetId);
+    return rows.map(r=>({id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined}));
+  }
+
   setAssetState(id:string,state:ContentAssetRecord['state']) {
     this.db.prepare('UPDATE content_assets SET state=? WHERE id=?').run(state,id);
   }
