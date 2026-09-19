@@ -5,6 +5,8 @@ import path from 'path';
 import { ArchiveDatabase } from './database';
 import { ArchiveWorker } from './worker';
 import { ControlPlaneClient, type ArchiveCommand } from './control-plane';
+import { sha256File } from './hash';
+import { uploadOriginalToArweave } from './arweave/uploader';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -27,7 +29,23 @@ export class ArchiveDaemon {
     const source = this.db.getSource(command.sourceId);
     if (!source) throw new Error(`Unknown source ${command.sourceId}`);
 
-    if (command.type === 'LIST_DIRECTORY') {
+    if (command.type === 'UPLOAD_ASSET_ARWEAVE') {
+      if(!command.expectedSha256||!command.collectionId||!command.archiveName) throw new Error('Incomplete Arweave upload command');
+      const root=path.resolve(source.rootPath);
+      const target=path.resolve(root,command.relativePath);
+      const relative=path.relative(root,target);
+      if(relative.startsWith('..')||path.isAbsolute(relative)) throw new Error('Upload path escapes registered source');
+      // Re-hash immediately before permanent upload. The approved bytes must be
+      // exactly the bytes that were reviewed.
+      const currentHash=await sha256File(target);
+      if(currentHash!==command.expectedSha256) throw new Error('Source bytes changed after approval; re-review required');
+      await this.control.updateCommand({commandId:command.id,state:'RUNNING'});
+      const uploaded=await uploadOriginalToArweave({filePath:target,archiveName:command.archiveName,contentType:command.contentType,sha256:currentHash,collectionId:command.collectionId});
+      await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId}});
+      return;
+    }
+
+        if (command.type === 'LIST_DIRECTORY') {
       const root = path.resolve(source.rootPath);
       const target = path.resolve(root, command.relativePath || '.');
       const relative = path.relative(root, target);
