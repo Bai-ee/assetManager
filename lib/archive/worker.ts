@@ -22,9 +22,39 @@ async function* walk(root: string, current = root): AsyncGenerator<string> {
   }
 }
 
+export interface ArchiveWorkerOptions {
+  stableFileDwellMs?: number;
+  onHeartbeat?: (status: { jobId: string; sourceId: string; at: string }) => void;
+  heartbeatEveryFiles?: number;
+}
+
 export class ArchiveWorker {
   private pauseRequested = new Set<string>();
-  constructor(private store = new ArchiveDatabase()) {}
+  private options: Required<Pick<ArchiveWorkerOptions, 'stableFileDwellMs' | 'heartbeatEveryFiles'>> & ArchiveWorkerOptions;
+
+  constructor(private store = new ArchiveDatabase(), options: ArchiveWorkerOptions = {}) {
+    this.options = {
+      stableFileDwellMs: options.stableFileDwellMs ?? 2000,
+      heartbeatEveryFiles: options.heartbeatEveryFiles ?? 100,
+      ...options,
+    };
+  }
+
+  private async waitForStableFile(filePath: string): Promise<Awaited<ReturnType<typeof fs.stat>>> {
+    const before = await fs.stat(filePath);
+    if (this.options.stableFileDwellMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, this.options.stableFileDwellMs));
+    }
+    const after = await fs.stat(filePath);
+    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      throw new Error('File is still changing; retry later');
+    }
+    return after;
+  }
+
+  private heartbeat(jobId: string, sourceId: string): void {
+    this.options.onHeartbeat?.({ jobId, sourceId, at: new Date().toISOString() });
+  }
 
   pause(jobId: string): void {
     const job = this.store.getJob(jobId);
@@ -81,12 +111,19 @@ export class ArchiveWorker {
       return this.store.getJob(jobId)!;
     }
 
+    let processedSinceHeartbeat = 0;
+    this.heartbeat(jobId, source.id);
     for await (const fullPath of walk(selectedRoot)) {
       if (this.pauseRequested.has(jobId)) return this.store.getJob(jobId)!;
+      processedSinceHeartbeat++;
+      if (processedSinceHeartbeat >= this.options.heartbeatEveryFiles) {
+        this.heartbeat(jobId, source.id);
+        processedSinceHeartbeat = 0;
+      }
       const relativePath = path.relative(source.rootPath, fullPath);
       const id = locationId(source.id, relativePath);
       try {
-        const stat = await fs.stat(fullPath);
+        const stat = await this.waitForStableFile(fullPath);
         const prior = this.store.getLocation(id);
 
         // Incremental rescan: unchanged known location is already accounted for.
