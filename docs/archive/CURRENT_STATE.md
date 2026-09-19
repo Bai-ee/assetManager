@@ -63,3 +63,20 @@ Next exact tasks:
 3. Add source-offline detection rather than allowing a disconnected walk to look complete.
 4. Add tests for duplicate paths, changed files, restart recovery, traversal escape, and source disconnect.
 5. Run TypeScript/build validation.
+
+
+## Phase 1 checkpoint — durability controls
+Implemented:
+- SQLite WAL persistence is now the active worker state layer.
+- Explicit pause() and resume() job controls.
+- RUNNING jobs recover to PAUSED after worker/database restart.
+- In-flight HASHING/ANALYZING/UPLOADING records recover as RETRYABLE_FAILED.
+- Source availability is checked before traversal and again before COMPLETE; an unavailable NAS pauses the job and marks the source OFFLINE.
+- Added archive validation scripts: npm run typecheck and npm run test:archive.
+- Added tests for byte-identical dedupe, incremental unchanged rescans, changed-file rehash, restart recovery, and path traversal rejection.
+
+Still required before Phase 1 is complete:
+1. Run install/typecheck/test in an execution environment and fix any compile/runtime failures.
+2. Add a stronger disconnect signal during deep traversal (current end-of-run source access check catches root disappearance, but individual subtree errors are still skipped).
+3. Add stable-file dwell policy before hashing files actively being written.
+4. Add worker heartbeat/control-plane contract.
