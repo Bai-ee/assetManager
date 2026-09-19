@@ -10,7 +10,8 @@
     "scan": "tsx lib/scanner/cli.ts",
     "archive:scan": "tsx lib/archive/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test:archive": "tsx --test lib/archive/*.test.ts"
+    "test:archive": "tsx --test lib/archive/*.test.ts",
+    "archive:worker": "tsx lib/archive/daemon.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
