@@ -2,6 +2,10 @@
 // into (TWELVELABS_INDEX_ID). Not run by the daemon or any automated path —
 // an index is created once, by a human, before the worker is pointed at it.
 //
+// Optional: only for Marengo search (indexed-assets); not required for
+// analysis. The worker's Jev evidence comes from Pegasus analyzeAsset, which
+// needs no index — this CLI exists only if/when a search feature wants one.
+//
 // Usage: npm run archive:twelvelabs-index -- <index-name>
 
 const BASE_URL = process.env.TWELVELABS_API_URL || 'https://api.twelvelabs.io/v1.3';

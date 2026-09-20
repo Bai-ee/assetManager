@@ -193,3 +193,82 @@ test('a TwelveLabs submission failure is recorded but does not abort the job', a
   f.db.close();
   await fs.rm(f.dir, { recursive: true, force: true });
 });
+
+test('sweepPendingAnalysis advances an INDEXING row to READY, runs Jev, and syncs once', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const fakeTwelveLabs: any = {
+    configured: true,
+    getAsset: async () => ({ status: 'ready' }),
+    analyzeAsset: async () => ({ text: 'archival description', usage: { input_tokens: 10, output_tokens: 5 }, finishReason: 'stop', raw: {} }),
+  };
+  const analysis = new ArchiveAnalysisService(f.db, fakeTwelveLabs);
+  const jevCalls: string[] = [];
+  const jevProvider: any = {
+    decide: async (_input: any, question: string) => { jevCalls.push(question); return [{ value: 'x', probability: 0.95 }]; },
+  };
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService(jevProvider));
+
+  // Hash the file directly through the worker, bypassing the daemon's own
+  // analysis step, so the only observation in play is the one seeded below.
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  const job = worker.createJob(source.id);
+  await worker.run(job.id);
+  const location = f.db.db.prepare("SELECT content_asset_id FROM file_locations WHERE relative_path='clip.mp4'").get() as { content_asset_id: string };
+  const assetId = location.content_asset_id;
+  f.db.upsertObservation({ id: videoObservationId(assetId), contentAssetId: assetId, provider: 'twelvelabs', providerAssetId: 'task1', kind: 'video_understanding', status: 'INDEXING' });
+
+  process.env.ANTHROPIC_API_KEY = 'sk-test';
+  try {
+    await (daemon as any).sweepPendingAnalysis();
+  } finally {
+    delete process.env.ANTHROPIC_API_KEY;
+  }
+
+  const observation = f.db.listObservations(assetId).find(o => o.id === videoObservationId(assetId));
+  assert.equal(observation?.status, 'READY');
+  assert.equal(observation?.summary, 'archival description');
+
+  assert.equal(jevCalls.length, JEV_QUESTIONS.length);
+  const decisions = f.db.listJevDecisions(assetId);
+  assert.equal(decisions.length, JEV_QUESTIONS.length);
+
+  assert.equal(control.synced.length, 1); // synced exactly once for this asset
+  assert.equal(control.synced[0].sourceId, source.id);
+  assert.equal(control.synced[0].asset.decisions.length, JEV_QUESTIONS.length);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('sweepPendingAnalysis processes at most 5 pending observations per call, oldest first', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+  const seenProviderAssetIds: string[] = [];
+  const fakeTwelveLabs: any = {
+    configured: true,
+    getAsset: async (providerAssetId: string) => { seenProviderAssetIds.push(providerAssetId); return { status: 'processing' }; }, // stays INDEXING; analyzeAsset never reached
+  };
+  const analysis = new ArchiveAnalysisService(f.db, fakeTwelveLabs);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  for (let i = 0; i < 7; i++) {
+    const assetId = `asset-${i}`;
+    f.db.insertAsset({ id: assetId, sha256: assetId, sizeBytes: 1, createdAt: new Date().toISOString(), state: 'QUEUED' });
+    const observationId = `obs-${i}`;
+    f.db.upsertObservation({ id: observationId, contentAssetId: assetId, provider: 'twelvelabs', providerAssetId: `task-${i}`, kind: 'video_understanding', status: 'SUBMITTED' });
+    // upsertObservation stamps created_at with "now"; back-date deterministically so ordering is unambiguous.
+    f.db.db.prepare('UPDATE observations SET created_at=? WHERE id=?').run(new Date(2020, 0, i + 1).toISOString(), observationId);
+  }
+
+  await (daemon as any).sweepPendingAnalysis();
+
+  assert.equal(seenProviderAssetIds.length, 5);
+  assert.deepEqual(seenProviderAssetIds, ['task-0', 'task-1', 'task-2', 'task-3', 'task-4']);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
