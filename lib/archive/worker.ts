@@ -11,13 +11,24 @@ function locationId(sourceId: string, relativePath: string): string {
   return createHash('sha256').update(sourceId + ':' + relativePath).digest('hex');
 }
 
+// macOS resource forks (AppleDouble `._*` companion files) and `.DS_Store` are
+// SMB/Finder artifacts, not archive content. Skipping them at discovery keeps
+// them out of hashing, TwelveLabs, Jev, and the human review queue entirely —
+// a real NAS folder run surfaced six of these sharing one 368-byte asset.
+function isFilesystemArtifact(name: string): boolean {
+  return name.startsWith('._') || name === '.DS_Store';
+}
+
 async function* walk(root: string, current = root): AsyncGenerator<string> {
   const dir = await fs.opendir(current);
   for await (const entry of dir) {
     if (SKIP.has(entry.name)) continue;
     const full = path.join(current, entry.name);
-    if (entry.isDirectory()) yield* walk(root, full);
-    else if (entry.isFile()) yield full;
+    if (entry.isDirectory()) { yield* walk(root, full); continue; }
+    if (entry.isFile()) {
+      if (isFilesystemArtifact(entry.name)) continue;
+      yield full;
+    }
   }
 }
 

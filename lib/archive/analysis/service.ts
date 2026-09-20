@@ -6,8 +6,17 @@ function observationId(assetId:string,provider:string,kind:string){
   return createHash('sha256').update(`${assetId}:${provider}:${kind}`).digest('hex');
 }
 
+/** The deterministic id `analyzeVideo` stores its observation under. Exported so
+ * callers (the daemon's tests, a future poller) can look up or seed that exact
+ * row without reimplementing the hash. */
+export function videoObservationId(contentAssetId:string):string {
+  return observationId(contentAssetId,'twelvelabs','video_understanding');
+}
+
 export class ArchiveAnalysisService {
   constructor(private db=new ArchiveDatabase(),private twelveLabs=new TwelveLabsAdapter()) {}
+
+  get configured(): boolean { return Boolean(this.twelveLabs?.configured); }
 
   async advanceVideo(contentAssetId:string) {
     const obs=this.db.listObservations(contentAssetId).find(x=>x.provider==='twelvelabs'&&x.kind==='video_understanding');

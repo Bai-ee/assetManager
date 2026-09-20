@@ -124,6 +124,22 @@ test('rejects sibling path with matching source prefix', async () => {
   await fs.rm(f.dir, {recursive:true,force:true});
 });
 
+test('skips macOS resource forks and .DS_Store at discovery', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'real content');
+  await fs.writeFile(path.join(f.sourceRoot, '._clip.mp4'), 'apple double');
+  await fs.writeFile(path.join(f.sourceRoot, '.DS_Store'), 'finder metadata');
+  const source = await f.worker.registerSource('test', f.sourceRoot);
+  const job = f.worker.createJob(source.id);
+  const done = await f.worker.run(job.id);
+  assert.equal(done.counters.discovered, 1);
+  assert.equal(done.counters.hashed, 1);
+  const rows = f.db.db.prepare('SELECT relative_path FROM file_locations').all() as Array<{relative_path:string}>;
+  assert.deepEqual(rows.map(r => r.relative_path).sort(), ['clip.mp4']);
+  f.db.close();
+  await fs.rm(f.dir, {recursive:true,force:true});
+});
+
 test('unreadable or vanished selected root pauses instead of completing', async () => {
   const f = await fixture();
   const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });

@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "test:archive": "TESTS=$(find lib/archive -name '*.test.ts' | sort) && test -n \"$TESTS\" && tsx --test $TESTS",
     "archive:worker": "tsx --env-file-if-exists=.env.local lib/archive/daemon.ts",
-    "archive:source": "tsx --env-file-if-exists=.env.local lib/archive/source-cli.ts"
+    "archive:source": "tsx --env-file-if-exists=.env.local lib/archive/source-cli.ts",
+    "archive:twelvelabs-index": "tsx --env-file-if-exists=.env.local lib/archive/twelvelabs-index-cli.ts"
   },
   "dependencies": {
     "next": "^14.2.0",

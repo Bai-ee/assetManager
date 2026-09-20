@@ -1,0 +1,99 @@
+{
+  "generatedAt": "2026-09-20T17:50:55.406Z",
+  "source": "features/x-content-inventory/jev-taxonomy.js",
+  "reviewBands": {
+    "AUTO_CONFIRM": 0.9,
+    "QUICK_REVIEW": 0.6
+  },
+  "questions": [
+    {
+      "id": "pillar",
+      "question": "Which content pillar does this artifact belong to?",
+      "choices": [
+        "was-there",
+        "made-this",
+        "found-this",
+        "how-made",
+        "thirty-years",
+        "building-now"
+      ],
+      "fills": "pillar",
+      "gate": false,
+      "openEnded": false,
+      "blocked": null
+    },
+    {
+      "id": "series",
+      "question": "Which posting series could publish this artifact?",
+      "choices": [
+        "C1",
+        "C2",
+        "C3",
+        "C4",
+        "C5",
+        "C6",
+        "C7",
+        "C8",
+        "C9"
+      ],
+      "fills": "series",
+      "gate": false,
+      "openEnded": false,
+      "blocked": null
+    },
+    {
+      "id": "era",
+      "question": "What era is this artifact from?",
+      "choices": [
+        "pre-1985",
+        "1985-1989",
+        "1990-1994",
+        "1995-1999",
+        "2000-2004",
+        "2005-2009",
+        "2010-2019",
+        "2020-present",
+        "unknown"
+      ],
+      "fills": "eraYear",
+      "gate": false,
+      "openEnded": false,
+      "blocked": null
+    },
+    {
+      "id": "clientWork",
+      "question": "Is this client work, or work made for someone else?",
+      "choices": [
+        "yes",
+        "no",
+        "unclear"
+      ],
+      "fills": "rights",
+      "gate": true,
+      "openEnded": false,
+      "blocked": null
+    },
+    {
+      "id": "postability",
+      "question": "Could this artifact carry a post on its own, or is it supporting material?",
+      "choices": [
+        "stands-alone",
+        "supporting",
+        "internal-only"
+      ],
+      "fills": "status",
+      "gate": false,
+      "openEnded": false,
+      "blocked": null
+    },
+    {
+      "id": "entities",
+      "question": "Which people, venues, labels, releases or events are named in this artifact?",
+      "choices": [],
+      "fills": "entities",
+      "gate": false,
+      "openEnded": true,
+      "blocked": "no entity table exists in the worker schema yet — see ARCHIVE-X-CONTENT-ENGINE-PLAN.md §4b"
+    }
+  ]
+}
