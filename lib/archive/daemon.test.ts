@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { ArchiveDatabase } from './database';
 import { ArchiveWorker } from './worker';
 import { ArchiveDaemon } from './daemon';
@@ -22,15 +23,22 @@ async function fixture() {
 function fakeControl() {
   const synced: any[] = [];
   const commands: any[] = [];
+  const intakeUpdates: any[] = [];
+  const intakePurges: any[] = [];
   return {
     configured: false,
     synced,
     commands,
+    intakeUpdates,
+    intakePurges,
     heartbeat: async () => {},
     registerSource: async () => {},
     pollCommands: async () => [],
     updateCommand: async (u: any) => { commands.push(u); },
     syncAsset: async (payload: any) => { synced.push(payload); },
+    listIntake: async () => [],
+    updateIntake: async (u: any) => { intakeUpdates.push(u); },
+    purgeIntake: async (p: any) => { intakePurges.push(p); },
   };
 }
 
@@ -312,6 +320,78 @@ test('sweepPendingAnalysis processes at most 5 pending observations per call, ol
 
   assert.equal(seenProviderAssetIds.length, 5);
   assert.deepEqual(seenProviderAssetIds, ['task-0', 'task-1', 'task-2', 'task-3', 'task-4']);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('a cloud-intake UPLOAD_ASSET_ARWEAVE command marks REVIEWED then, on completion, ARCHIVED + purges the scratch file', async () => {
+  const f = await fixture();
+  const intakeId = 'intake-upload-1';
+  const intakeDir = path.join(f.sourceRoot, intakeId);
+  await fs.mkdir(intakeDir, { recursive: true });
+  const bytes = Buffer.from('fake photo bytes');
+  await fs.writeFile(path.join(intakeDir, 'photo.jpg'), bytes);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const jevProvider: any = { decide: async () => { throw new Error('not reached'); } };
+  const fakeUpload = async () => ({ transactionId: 'tx-1', arweaveUrl: 'https://arweave.net/tx-1', sizeBytes: bytes.length, tags: [] });
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService(jevProvider), fakeUpload as any);
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('Cloud intake', f.sourceRoot);
+  // Bypasses ensureCloudIntakeSource (only run() calls it); this is what a
+  // real daemon.run() would have set at startup.
+  (daemon as any).cloudIntakeSourceId = source.id;
+  (daemon as any).cloudIntakeRootPath = source.rootPath;
+
+  const command = {
+    id: 'cmd-upload', type: 'UPLOAD_ASSET_ARWEAVE' as const, workerId: 'test-worker', sourceId: source.id,
+    relativePath: `${intakeId}/photo.jpg`, expectedSha256: sha256, collectionId: 'col-1', archiveName: 'photo.jpg',
+    contentAssetId: sha256, contentType: 'image/jpeg', state: 'QUEUED' as const,
+  };
+
+  await assert.doesNotReject(() => (daemon as any).execute(command));
+
+  assert.deepEqual(control.intakeUpdates.map((u: any) => u.state), ['REVIEWED', 'ARCHIVED']);
+  assert.equal(control.intakeUpdates[0].intakeId, intakeId);
+  assert.equal(control.intakePurges.length, 1);
+  assert.equal(control.intakePurges[0].intakeId, intakeId);
+  assert.equal(control.commands.some((c: any) => c.state === 'COMPLETE'), true);
+
+  await assert.rejects(() => fs.access(intakeDir), 'scratch directory removed once archived and purged');
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('a non-cloud-intake UPLOAD_ASSET_ARWEAVE command never touches intake state', async () => {
+  const f = await fixture();
+  const bytes = Buffer.from('a NAS original');
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), bytes);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const fakeUpload = async () => ({ transactionId: 'tx-2', arweaveUrl: 'https://arweave.net/tx-2', sizeBytes: bytes.length, tags: [] });
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any), fakeUpload as any);
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('Bryan NAS', f.sourceRoot);
+  // No cloudIntakeSourceId set: this source is Lane 1 (a real NAS folder).
+
+  const command = {
+    id: 'cmd-upload-nas', type: 'UPLOAD_ASSET_ARWEAVE' as const, workerId: 'test-worker', sourceId: source.id,
+    relativePath: 'clip.mp4', expectedSha256: sha256, collectionId: 'col-2', archiveName: 'clip.mp4',
+    contentAssetId: sha256, contentType: 'video/mp4', state: 'QUEUED' as const,
+  };
+
+  await assert.doesNotReject(() => (daemon as any).execute(command));
+
+  assert.equal(control.intakeUpdates.length, 0);
+  assert.equal(control.intakePurges.length, 0);
 
   f.db.close();
   await fs.rm(f.dir, { recursive: true, force: true });

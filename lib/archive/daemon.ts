@@ -15,12 +15,23 @@ import { AnthropicJevProvider } from './jev/anthropic-provider';
 import { JEV_QUESTIONS } from './jev/taxonomy';
 import { buildAssetState } from './schema/asset-state';
 import type { ContentAssetRecord } from './types';
+import {
+  ensureCloudIntakeSource,
+  drainIntake,
+  markIntakeReviewed,
+  archiveAndPurgeIntake,
+  resolveIntakeIdFromRelativePath,
+} from './intake';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export class ArchiveDaemon {
   private stopped = false;
   readonly workerId: string;
+  /** Set once ensureCloudIntakeSource resolves at daemon start (see run()).
+   * Identifies which UPLOAD_ASSET_ARWEAVE commands belong to Lane 2. */
+  private cloudIntakeSourceId?: string;
+  private cloudIntakeRootPath?: string;
 
   constructor(
     private db = new ArchiveDatabase(),
@@ -28,6 +39,7 @@ export class ArchiveDaemon {
     workerId = process.env.HITLOOP_ARCHIVE_WORKER_ID,
     private analysis = new ArchiveAnalysisService(db),
     private jev = new JevDecisionService(new AnthropicJevProvider()),
+    private uploadOriginal = uploadOriginalToArweave,
   ) {
     this.workerId = workerId || createHash('sha256').update(hostname()).digest('hex').slice(0, 24);
   }
@@ -139,6 +151,35 @@ export class ArchiveDaemon {
     for(const assetId of this.jobAssetIds(sourceId,jobId)) await this.pushAssetSync(sourceId,jobId,assetId);
   }
 
+  /** Runs the identical hash -> dedupe -> analysis -> Jev -> sync pipeline
+   * PROCESS_COLLECTION uses (see execute() below), for one selected subfolder
+   * outside the archive_commands queue. Used by Lane 2 cloud intake
+   * (lib/archive/intake.ts drainIntake) so a downloaded phone upload gets no
+   * different treatment than a NAS folder. */
+  async runIntakeCollectionJob(sourceId:string,selectedRelativePath:string) {
+    const worker=new ArchiveWorker(this.db,{onHeartbeat: async h => {
+      try { await this.control.heartbeat({workerId:this.workerId,sourceId,jobId:h.jobId,state:'PROCESSING',at:h.at}); } catch {}
+    }});
+    const job=worker.createJob(sourceId,selectedRelativePath);
+    await worker.run(job.id);
+    await this.runAnalysisAndJev(sourceId,job.id);
+    await this.syncJobAssets(sourceId,job.id);
+    return job;
+  }
+
+  /** Lane 2 poll-loop step: pull up to a few UPLOADED phone/camera-roll
+   * uploads and run them through the same job path as a NAS folder. Never
+   * throws (see run()'s call site); a no-op until ensureCloudIntakeSource has
+   * resolved once at daemon start. */
+  private async drainCloudIntake() {
+    if(!this.cloudIntakeSourceId) return;
+    const source=this.db.getSource(this.cloudIntakeSourceId); if(!source) return;
+    await drainIntake({
+      db:this.db, control:this.control, workerId:this.workerId, source,
+      runCollectionJob:(sourceId,relativePath)=>this.runIntakeCollectionJob(sourceId,relativePath),
+    });
+  }
+
   /** Background progress check for videos still being processed by TwelveLabs
    * (SUBMITTED/INDEXING). A job only calls analyzeVideo/advanceVideo once, at
    * hash time; real indexing can still be in flight after the job completes,
@@ -181,13 +222,21 @@ export class ArchiveDaemon {
       const target=path.resolve(root,command.relativePath);
       const relative=path.relative(root,target);
       if(relative.startsWith('..')||path.isAbsolute(relative)) throw new Error('Upload path escapes registered source');
+      // Lane 2 only: an UPLOAD_ASSET_ARWEAVE command for this asset only
+      // exists once HITLOOP's human review confirmed it, so its arrival is
+      // itself the REVIEWED signal (see intake.ts markIntakeReviewed).
+      const cloudIntakeId=command.sourceId===this.cloudIntakeSourceId?resolveIntakeIdFromRelativePath(command.relativePath):null;
+      if(cloudIntakeId) await markIntakeReviewed(this.control,this.workerId,cloudIntakeId);
       // Re-hash immediately before permanent upload. The approved bytes must be
       // exactly the bytes that were reviewed.
       const currentHash=await sha256File(target);
       if(currentHash!==command.expectedSha256) throw new Error('Source bytes changed after approval; re-review required');
       await this.control.updateCommand({commandId:command.id,state:'RUNNING'});
-      const uploaded=await uploadOriginalToArweave({filePath:target,archiveName:command.archiveName,contentType:command.contentType,sha256:currentHash,collectionId:command.collectionId});
+      const uploaded=await this.uploadOriginal({filePath:target,archiveName:command.archiveName,contentType:command.contentType,sha256:currentHash,collectionId:command.collectionId});
       await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId,collectionId:command.collectionId,archiveName:command.archiveName,sha256:currentHash,contentType:command.contentType||null,sourceId:command.sourceId,relativePath:command.relativePath}});
+      // Only after the command is durably COMPLETE: ARCHIVED, purge the
+      // Firebase object, delete the local scratch copy (D3/D4). Never before.
+      if(cloudIntakeId&&this.cloudIntakeRootPath) await archiveAndPurgeIntake({control:this.control,workerId:this.workerId,intakeId:cloudIntakeId,root:this.cloudIntakeRootPath});
       return;
     }
 
@@ -223,6 +272,15 @@ export class ArchiveDaemon {
   }
 
   async run(pollMs = 5000) {
+    // Lane 2 cloud intake: register the local scratch source once at start (D1 —
+    // never under /Volumes or any NAS mount). Non-fatal: a failure here just
+    // means drainCloudIntake stays a no-op until the next restart.
+    try {
+      const cloudSource = await ensureCloudIntakeSource(this.db, this.control, this.workerId);
+      this.cloudIntakeSourceId = cloudSource.id;
+      this.cloudIntakeRootPath = cloudSource.rootPath;
+    } catch (error) { console.log(`cloud intake source setup failed: ${error instanceof Error?error.message:String(error)}`); }
+
     // Restart recovery is local-first. Jobs that were RUNNING are converted to
     // PAUSED by ArchiveDatabase on open; resume them before accepting new work.
     for (const job of this.db.listResumableJobs()) {
@@ -258,6 +316,9 @@ export class ArchiveDaemon {
     await idleHeartbeat();
     let pollsSinceHeartbeat = 0;
     let pollsSinceSweep = 0;
+    // Offset from pollsSinceSweep's own 6-poll cadence (starts at 3, not 0) so
+    // the analysis sweep and the intake drain never land on the same tick.
+    let pollsSinceIntake = 3;
     while (!this.stopped) {
       if (++pollsSinceHeartbeat >= 12) { pollsSinceHeartbeat = 0; await idleHeartbeat(); }
       // ~30s at the default 5s pollMs. Awaited inline (not fire-and-forget), so
@@ -265,6 +326,10 @@ export class ArchiveDaemon {
       if (++pollsSinceSweep >= 6) {
         pollsSinceSweep = 0;
         try { await this.sweepPendingAnalysis(); } catch { /* a sweep failure must not stop the poll loop */ }
+      }
+      if (this.control.configured && ++pollsSinceIntake >= 6) {
+        pollsSinceIntake = 0;
+        try { await this.drainCloudIntake(); } catch { /* a drain failure must not stop the poll loop */ }
       }
       try {
         const commands = await this.control.pollCommands(this.workerId);
