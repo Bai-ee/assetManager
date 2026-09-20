@@ -107,17 +107,14 @@ original assets → Arweave TXs → collection manifest → Arweave TX → stati
 - No secrets or private absolute NAS/network details in public metadata.
 - Failed assets do not stop the whole collection.
 
-## Current gaps / next work
+## Current gaps
 
-1. Automatically synchronize worker assets, observations, and Jev decisions into HITLOOP review records.
-2. Automatically derive approved collection assets/byte totals for the Arweave checkpoint instead of manual entry.
-3. Add command claiming/leases/idempotency for multi-worker safety.
-4. Refine TwelveLabs asset/index lifecycle and validate against current API when credentials are available.
-5. Research/use a real current Turbo quote API if available; keep legacy estimate clearly distinct until then.
-6. Verify permanent TX availability before marking `VERIFIED`.
-7. Upload the static viewer itself to Arweave and prove it can load a real test manifest without HITLOOP.
-8. Run build/typecheck/tests in an execution environment and fix failures. Tests have been authored but must not be described as passing until CI/execution confirms them.
-9. Validate `better-sqlite3` on the actual always-on worker host. If WD My Cloud cannot reliably run it, use an always-on SMB-mounted bridge host.
+- Archive Worker CI is actively validating the archive subsystem independently from legacy AssetManager UI type errors.
+- TwelveLabs credentials are intentionally not configured yet; provider integration remains dormant until the key is added locally.
+- Turbo SDK's typed upload API currently uses a buffered worker upload. This is acceptable only for small POC files; large-original upload must be replaced with a verified large-file strategy before 1 TB-scale use.
+- HITLOOP Vercel deployment is currently failing. GitHub reports the failure, while the connected Vercel tool account currently exposes no projects, so the remote build log is not yet available through that connection.
+- Human-confirmed assets now aggregate into the Arweave checkpoint, permanent original uploads return transaction identity, and collection finalization verifies stored transaction/hash/collection identity.
+- A verified live preview URL is still blocked on a successful HITLOOP deployment.
 
 ## Agent rule
 
