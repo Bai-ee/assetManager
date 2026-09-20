@@ -108,14 +108,44 @@ export class ArchiveDaemon {
     }
   }
 
+  /** Push one asset's current observations/decisions to HITLOOP. Shared by the
+   * per-job sync (scoped to that job's file locations) and the background
+   * sweep (which syncs an asset outside any specific job). */
+  private async pushAssetSync(sourceId:string,collectionJobId:string|undefined,assetId:string) {
+    const asset=this.db.getAsset(assetId); if(!asset) return;
+    const locations=this.db.listAssetLocations(asset.id).filter(x=>x.sourceId===sourceId);
+    const observations=this.db.listObservations(asset.id);
+    const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:reviewBand(d.confidence??0)}));
+    const mediaType=locations[0]?inferMediaType(locations[0].relativePath):undefined;
+    try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
+  }
+
   private async syncJobAssets(sourceId:string,jobId:string) {
-    for(const assetId of this.jobAssetIds(sourceId,jobId)) {
+    for(const assetId of this.jobAssetIds(sourceId,jobId)) await this.pushAssetSync(sourceId,jobId,assetId);
+  }
+
+  /** Background progress check for videos still being processed by TwelveLabs
+   * (SUBMITTED/INDEXING). A job only calls analyzeVideo/advanceVideo once, at
+   * hash time; real indexing can still be in flight after the job completes,
+   * so this sweep is what actually lands READY + Jev decisions once TwelveLabs
+   * finishes. Bounded and oldest-first so one slow asset can't starve the rest
+   * across sweeps. Never throws: called on an idle timer, not a job. */
+  private async sweepPendingAnalysis() {
+    if(!this.analysis.configured) return; // the poll loop already gates on this; checked again for direct callers (tests)
+    const rows=this.db.db.prepare(
+      "SELECT content_asset_id FROM observations WHERE provider='twelvelabs' AND kind='video_understanding' AND status IN ('SUBMITTED','INDEXING') ORDER BY created_at ASC LIMIT 5"
+    ).all() as Array<{content_asset_id:string}>;
+
+    for(const row of rows) {
+      const assetId=row.content_asset_id;
       const asset=this.db.getAsset(assetId); if(!asset) continue;
-      const locations=this.db.listAssetLocations(asset.id).filter(x=>x.sourceId===sourceId);
-      const observations=this.db.listObservations(asset.id);
-      const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:reviewBand(d.confidence??0)}));
-      const mediaType=locations[0]?inferMediaType(locations[0].relativePath):undefined;
-      try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId:jobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
+
+      try { await this.analysis.advanceVideo(assetId); } catch { /* recorded as FAILED; still worth syncing below */ }
+      await this.runJevForAsset(asset);
+
+      const location=this.db.listAssetLocations(assetId)[0];
+      if(!location) continue; // no known source to sync this asset under yet
+      await this.pushAssetSync(location.sourceId,undefined,assetId);
     }
   }
 
@@ -206,8 +236,15 @@ export class ArchiveDaemon {
     };
     await idleHeartbeat();
     let pollsSinceHeartbeat = 0;
+    let pollsSinceSweep = 0;
     while (!this.stopped) {
       if (++pollsSinceHeartbeat >= 12) { pollsSinceHeartbeat = 0; await idleHeartbeat(); }
+      // ~30s at the default 5s pollMs. Awaited inline (not fire-and-forget), so
+      // it runs between poll iterations and never overlaps a running command.
+      if (++pollsSinceSweep >= 6) {
+        pollsSinceSweep = 0;
+        try { await this.sweepPendingAnalysis(); } catch { /* a sweep failure must not stop the poll loop */ }
+      }
       try {
         const commands = await this.control.pollCommands(this.workerId);
         for (const command of commands) {
