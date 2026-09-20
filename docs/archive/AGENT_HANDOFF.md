@@ -153,3 +153,18 @@ Then test progressively larger folders. Do not jump directly to the 1 TB NAS.
 ## Agent operating rule
 
 Every implementation change that materially changes status, blockers, architecture or next steps must update `CURRENT_STATE.md`. Keep this handoff concise and durable. Never convert an unverified implementation into a claimed working capability.
+
+## Cross-feature merge map
+
+The Archive POC is intentionally split across two repositories:
+
+- `Bai-ee/assetManager` / `feat/archive-master-plan`: NAS-adjacent durable Archive Worker, hashing/dedupe, local state, media-analysis boundary, Jev decision layer and worker-side permanent upload.
+- `Bai-ee/port_2026` / `feat/archive-jev-poc`: HITLOOP control plane, /archive operator UI, remote commands, human review, approved-asset aggregation, permanent-upload orchestration, manifest finalization and independent viewer.
+
+A social/content feature should consume confirmed archive records and content-intelligence metadata. It should not consume raw NAS files directly. Keep stable archive provenance/facts separate from mutable publishing strategy such as brand routing, hook, format, destination, production effort, monetization path and publishing status.
+
+The Creative Ecosystem Inventory supplied during development defines the downstream strategy layer. Before merging a Twitter/social feature, preserve this contract:
+
+`source → archive worker → observations → Asset State → Jev → human confirmation → archive record → content intelligence → social feature → publish/measure`
+
+Publishing results may feed back into content intelligence, but must not rewrite source provenance or confirmed archival facts.
