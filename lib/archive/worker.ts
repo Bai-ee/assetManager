@@ -160,8 +160,36 @@ export class ArchiveWorker {
         }
         this.store.bumpJob(jobId, 'hashed');
       } catch (error) {
+        // A file can fail before any location row exists: an unreadable stat, or a
+        // file still being written when the stability check runs. Safety invariant 9
+        // (unsupported/corrupt files are recorded, not silently lost) means the
+        // failure must still leave a durable, retryable FileLocation — retry work is
+        // driven off file_locations.state, so a missing row is a permanently dropped
+        // file, not merely a missing counter.
+        const now = new Date().toISOString();
         const current = this.store.getLocation(id);
-        if (current) this.store.upsertLocation({ ...current, state: 'RETRYABLE_FAILED', error: error instanceof Error ? error.message : String(error) });
+        let record = current;
+        if (!record) {
+          // Best effort: capture whatever metadata is still readable. An unreadable
+          // or vanished file is recorded with unknown size/mtime so the next scan
+          // treats it as changed and retries it.
+          let sizeBytes = 0;
+          let modifiedAtMs = 0;
+          try {
+            const seen = await fs.stat(fullPath);
+            sizeBytes = Number(seen.size);
+            modifiedAtMs = Number(seen.mtimeMs);
+          } catch { /* metadata unavailable; the row itself is what must survive */ }
+          record = {
+            id, sourceId: source.id, relativePath, sizeBytes, modifiedAtMs,
+            discoveredAt: now, lastSeenAt: now, state: 'DISCOVERED',
+          };
+          this.store.bumpJob(jobId, 'discovered');
+        }
+        this.store.upsertLocation({
+          ...record, lastSeenAt: now, state: 'RETRYABLE_FAILED',
+          error: error instanceof Error ? error.message : String(error),
+        });
         this.store.bumpJob(jobId, 'failed');
       }
     }

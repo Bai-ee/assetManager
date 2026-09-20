@@ -10,7 +10,7 @@
     "scan": "tsx lib/scanner/cli.ts",
     "archive:scan": "tsx lib/archive/cli.ts",
     "typecheck": "tsc --noEmit",
-    "test:archive": "tsx --test lib/archive/*.test.ts",
+    "test:archive": "TESTS=$(find lib/archive -name '*.test.ts' | sort) && test -n \"$TESTS\" && tsx --test $TESTS",
     "archive:worker": "tsx lib/archive/daemon.ts",
     "archive:source": "tsx lib/archive/source-cli.ts"
   },
