@@ -38,3 +38,66 @@ HITLOOP should treat heartbeats as operational telemetry, not archival truth. No
 ## Security boundary
 
 The worker may reveal logical source IDs and job counters to HITLOOP. Local absolute NAS paths must not be transmitted by default. Original media only leaves the source as an explicit processing/upload operation in later phases.
+
+## Lane 2 cloud intake (W3)
+
+Phone/camera-roll uploads staged by HITLOOP in its own Firebase bucket (see
+`docs/archive/INTAKE_CONTRACT.md`, owned by HITLOOP) are drained by the worker
+through a dedicated local source, `lib/archive/intake.ts`. The NAS is never
+written (D1, master plan): downloaded bytes land under
+`os.tmpdir()/hitloop-archive-intake/<intakeId>/<fileName>`, registered once at
+daemon start as a source labeled **Cloud intake** — never a path under
+`/Volumes` or any NAS mount.
+
+### Worker-side control-plane calls (`lib/archive/control-plane.ts`)
+
+| Call | HTTP | Notes |
+|---|---|---|
+| `listIntake(workerId)` | `GET /api/archive/worker/intake?workerId=` | Every `UPLOADED` doc with a signed download URL. Not a claim filter. |
+| `updateIntake({intakeId, workerId, state, sha256?, contentAssetId?, error?})` | `PATCH /api/archive/worker/intake` | One validated transition; HITLOOP re-reads the doc's current state server-side. |
+| `purgeIntake({intakeId, workerId})` | `DELETE /api/archive/worker/intake` | Only valid from `ARCHIVED`; deletes the Firebase object then sets `PURGED`. |
+
+All three are no-ops when the worker is unconfigured (`ControlPlaneClient.configured === false`), matching every other worker→HITLOOP call.
+
+### Worker state transitions
+
+```
+UPLOADED  --(drainIntake claims)-->            CLAIMED
+CLAIMED   --(download + job hashes it)-->      HASHED     (sha256 + contentAssetId)
+HASHED    --(an UPLOAD_ASSET_ARWEAVE command   REVIEWED   (the command's existence IS the
+            for this asset is observed)-->                 REVIEWED signal — see below)
+REVIEWED  --(that command reaches COMPLETE)--> ARCHIVED
+ARCHIVED  --(worker DELETE)-->                 PURGED     (Firebase object + local scratch file removed)
+any state --(unrecoverable failure)-->         FAILED     (scratch file/dir removed when the failure
+                                                             happened before a job ran; left in place
+                                                             otherwise for inspection)
+```
+
+**REVIEWED decision (plan §4 W3 step 6, choice a):** the worker — not
+HITLOOP — PATCHes `REVIEWED`, at the moment it observes an
+`UPLOAD_ASSET_ARWEAVE` command whose `sourceId` is the Cloud intake source.
+That command only ever exists once HITLOOP's human review confirmed the asset
+(`app/api/archive/review/route.js` PATCH → `archive_review.state = CONFIRMED`
+→ HITLOOP enqueues the upload command), so its arrival is itself the
+worker-observable REVIEWED signal — no separate poll or field is needed. This
+is best-effort and non-blocking: a failure to mark REVIEWED is logged but
+never prevents the actual Arweave upload from proceeding.
+
+**Purge timing (D3/D4):** `ARCHIVED` + the Firebase-object purge only happen
+after the daemon's own `UPLOAD_ASSET_ARWEAVE` command handling reaches
+`COMPLETE` for that asset — i.e. after the re-hash-before-upload check passes
+and the Arweave transaction succeeds. If HITLOOP is unreachable at that point,
+the scratch file is left on disk rather than deleted; because the intake doc
+is then no longer `UPLOADED` (it is stuck at whatever state the last
+successful PATCH reached), `listIntake`'s `UPLOADED`-only filter guarantees a
+later drain will never re-download it.
+
+### Job path reuse
+
+`drainIntake` never re-implements hashing/dedupe/analysis: it downloads into
+`<cloud-intake-root>/<intakeId>/<fileName>` and calls the same job path
+`PROCESS_COLLECTION` uses (`ArchiveDaemon.runIntakeCollectionJob`, factored out
+of `execute()`), scoped to `selectedRelativePath: intakeId`. Bounded to 3
+items per drain, oldest `createdAt` first; runs on the daemon's poll loop
+every 6 polls, offset by 3 from the existing TwelveLabs analysis sweep so the
+two never land on the same tick.
