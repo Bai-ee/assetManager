@@ -55,7 +55,7 @@ export class ArchiveDaemon {
       if(currentHash!==command.expectedSha256) throw new Error('Source bytes changed after approval; re-review required');
       await this.control.updateCommand({commandId:command.id,state:'RUNNING'});
       const uploaded=await uploadOriginalToArweave({filePath:target,archiveName:command.archiveName,contentType:command.contentType,sha256:currentHash,collectionId:command.collectionId});
-      await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId}});
+      await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId,collectionId:command.collectionId,archiveName:command.archiveName,sha256:currentHash,contentType:command.contentType||null,sourceId:command.sourceId,relativePath:command.relativePath}});
       return;
     }
 
