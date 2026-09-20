@@ -183,7 +183,11 @@ export class TwelveLabsAdapter {
         continue;
       }
       if(response.status>=500){
-        if(attempt===MAX_CHUNK_ATTEMPTS) throw new Error(`TwelveLabs chunk ${chunkIndex} upload failed: ${response.status}`);
+        // Keep the storage backend's own message: a bare status hides the
+        // cause (e.g. 501 NotImplemented names the offending header).
+        const detail=(typeof response.text==='function'?await response.text().catch(()=>''):'').replace(/\s+/g,' ').slice(0,300);
+        console.log(`twelvelabs chunk ${chunkIndex} attempt ${attempt} -> ${response.status} ${detail}`);
+        if(attempt===MAX_CHUNK_ATTEMPTS) throw new Error(`TwelveLabs chunk ${chunkIndex} upload failed: ${response.status} ${detail}`);
         continue;
       }
       // Non-retryable client error.

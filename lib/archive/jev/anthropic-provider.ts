@@ -135,7 +135,6 @@ export class AnthropicJevProvider implements JevProvider {
     const body = {
       model: this.model,
       max_tokens: 1536,
-      temperature: 0,
       tools: [tool],
       tool_choice: { type: 'tool', name: TOOL_NAME },
       messages: [

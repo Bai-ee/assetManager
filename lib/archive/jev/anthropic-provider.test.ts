@@ -51,7 +51,7 @@ test('one request answers all six questions and caches them per asset', async ()
   assert.equal((init.headers as Record<string,string>)['x-api-key'], 'sk-test');
   assert.equal((init.headers as Record<string,string>)['anthropic-version'], '2023-06-01');
   const body = JSON.parse(init.body as string);
-  assert.equal(body.temperature, 0);
+  assert.equal('temperature' in body, false, 'claude-sonnet-5 rejects temperature (400 deprecated)');
   assert.equal(body.tool_choice.name, 'answer_jev_questions');
   assert.equal(body.tools[0].input_schema.required.length, JEV_QUESTIONS.length);
 });
