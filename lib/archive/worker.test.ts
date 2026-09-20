@@ -113,23 +113,25 @@ test('unstable files are retryable instead of archived', async () => {
 
 
 test('rejects sibling path with matching source prefix', async () => {
-  const root = path.join(tempRoot, 'nas');
-  const sibling = path.join(tempRoot, 'nas-escape');
-  await fs.mkdir(root, { recursive: true });
+  const f = await fixture();
+  const sibling = path.join(f.dir, 'nas-escape');
   await fs.mkdir(sibling, { recursive: true });
-  const worker = new ArchiveWorker(db, { stableFileDwellMs: 0 });
-  const source = await worker.registerSource('NAS', root);
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('NAS', f.sourceRoot);
   const job = worker.createJob(source.id, '../nas-escape');
   await assert.rejects(() => worker.run(job.id), /escapes source root/);
+  f.db.close();
+  await fs.rm(f.dir, {recursive:true,force:true});
 });
 
 test('unreadable or vanished selected root pauses instead of completing', async () => {
-  const root = path.join(tempRoot, 'disconnect-nas');
-  await fs.mkdir(root, { recursive: true });
-  const worker = new ArchiveWorker(db, { stableFileDwellMs: 0 });
-  const source = await worker.registerSource('NAS', root);
+  const f = await fixture();
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('NAS', f.sourceRoot);
   const job = worker.createJob(source.id, '.');
-  await fs.rm(root, { recursive: true, force: true });
+  await fs.rm(f.sourceRoot, { recursive: true, force: true });
   const result = await worker.run(job.id);
   assert.equal(result.state, 'PAUSED');
+  f.db.close();
+  await fs.rm(f.dir, {recursive:true,force:true});
 });
