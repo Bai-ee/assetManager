@@ -101,3 +101,64 @@ of `execute()`), scoped to `selectedRelativePath: intakeId`. Bounded to 3
 items per drain, oldest `createdAt` first; runs on the daemon's poll loop
 every 6 polls, offset by 3 from the existing TwelveLabs analysis sweep so the
 two never land on the same tick.
+
+## UPLOAD_JSON (W7b)
+
+The Arweave wallet (`ARWEAVE_WALLET_JWK`) lives only on the worker, so small
+JSON/HTML documents HITLOOP needs on Arweave — archive records, collection
+manifests, the static viewer page — are uploaded by the worker on HITLOOP's
+behalf via this command type, delivered through the existing `pollCommands`
+poll loop alongside `PROCESS_COLLECTION`/`LIST_DIRECTORY`/`UPLOAD_ASSET_ARWEAVE`.
+
+Unlike every other command type, `UPLOAD_JSON` has **no `sourceId`** and
+**touches no filesystem**: the bytes to upload are already in the command
+payload. `ArchiveDaemon.execute()` dispatches it before the source lookup, so
+a worker with zero registered sources can still service it.
+
+### Command shape
+
+```json
+{
+  "id": "cmd-123",
+  "type": "UPLOAD_JSON",
+  "workerId": "worker-abc",
+  "state": "QUEUED",
+  "kind": "archive-record",
+  "fileName": "record.json",
+  "contentType": "application/json",
+  "payload": { "...": "object for archive-record/collection-manifest; an HTML string for viewer" },
+  "tags": [{ "name": "App-Name", "value": "HITLOOP-Archive" }],
+  "refs": {
+    "contentAssetId": "asset-1",
+    "collectionId": "col-1",
+    "version": 2,
+    "previousTransactionId": "tx-old"
+  }
+}
+```
+
+- `kind`: `'archive-record' | 'collection-manifest' | 'viewer'`.
+- `contentType`: `'application/json'` for the two JSON kinds, `'text/html'` for `viewer`.
+- `payload`: a plain object for the JSON kinds (uploaded as `JSON.stringify(payload, null, 2)`) or an HTML string for `viewer` (uploaded byte-for-byte, never re-encoded).
+- `tags`: arbitrary Arweave tags supplied by the caller; the worker adds a `Content-Type` tag only if one isn't already present.
+- `refs`: opaque to the worker — echoed back verbatim in the result so HITLOOP can relate the uploaded transaction to the record/collection it documents.
+
+### Worker behavior
+
+`CLAIMED` → `RUNNING` → upload via `uploadDocumentToArweave` (`lib/archive/arweave/uploader.ts`, buffered — these documents are KBs, not the multi-GB originals the streaming uploader guards against) → `COMPLETE`. Validates `kind`/`fileName`/`contentType`/`payload` before calling `updateCommand({state:'RUNNING'})`; any validation failure or upload error is caught and reported as `FAILED` with the error message, never left uncaught. A payload whose encoded bytes exceed 2 MB (`MAX_DOCUMENT_UPLOAD_BYTES`) is rejected before any Turbo client is constructed.
+
+### Result shape (on `COMPLETE`)
+
+```json
+{
+  "transactionId": "tx-abc",
+  "arweaveUrl": "https://arweave.net/tx-abc",
+  "sizeBytes": 512,
+  "tags": [{ "name": "App-Name", "value": "HITLOOP-Archive" }, { "name": "Content-Type", "value": "application/json" }],
+  "kind": "archive-record",
+  "fileName": "record.json",
+  "refs": { "contentAssetId": "asset-1", "collectionId": "col-1", "version": 2, "previousTransactionId": "tx-old" }
+}
+```
+
+On `FAILED`, `result` is absent and `error` carries the message (invalid `kind`, missing `fileName`/`contentType`/`payload`, over the 2 MB ceiling, or a Turbo upload failure).

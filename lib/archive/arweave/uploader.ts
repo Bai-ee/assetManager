@@ -1,6 +1,6 @@
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
-import type { Readable } from 'stream';
+import { Readable } from 'stream';
 import { ArweaveSigner, TurboFactory } from '@ardrive/turbo-sdk';
 
 function wallet(){
@@ -70,4 +70,52 @@ export async function uploadOriginalToArweave(input:{
   }
   if(!result?.id) throw new Error('Turbo upload returned no transaction id');
   return {transactionId:result.id,arweaveUrl:`https://arweave.net/${result.id}`,sizeBytes:info.size,tags};
+}
+
+/** 2 MB ceiling for lib/archive/daemon.ts UPLOAD_JSON commands (archive
+ * records, collection manifests, the static viewer). These are small
+ * JSON/HTML documents the worker uploads on HITLOOP's behalf because the
+ * Arweave wallet lives only here — never a source-file byte stream, so a
+ * caller that hands this function a large payload by mistake gets a clear
+ * error instead of a silent multi-MB data-item. */
+export const MAX_DOCUMENT_UPLOAD_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Uploads a small in-memory document (JSON or HTML text, already rendered to
+ * bytes by the caller) to Arweave via the same Turbo client/result contract
+ * as uploadOriginalToArweave. Buffered, not streamed from disk: these
+ * documents are KBs, well under MAX_DOCUMENT_UPLOAD_BYTES, so there is no
+ * memory-scaling concern like the original-file streamer guards against.
+ */
+export async function uploadDocumentToArweave(input:{
+  bytes:Buffer;
+  fileName:string;
+  contentType:string;
+  tags:ArweaveUploadTag[];
+  signal?:AbortSignal;
+  turboClient?:TurboUploadClient;
+}){
+  if(input.bytes.length>MAX_DOCUMENT_UPLOAD_BYTES) {
+    throw new Error(`Document ${input.fileName} is ${input.bytes.length} bytes, exceeding the ${MAX_DOCUMENT_UPLOAD_BYTES}-byte UPLOAD_JSON ceiling`);
+  }
+  const turbo=input.turboClient??createTurboClient();
+  const hasContentType=input.tags.some(t=>t.name==='Content-Type');
+  const tags:ArweaveUploadTag[]=hasContentType?input.tags:[...input.tags,{name:'Content-Type',value:input.contentType}];
+  let result:{id:string};
+  try{
+    // fileStreamFactory still returns a fresh Readable per call (same
+    // double-read contract as the original-file streamer above), even though
+    // the underlying bytes are already in memory.
+    result=await turbo.uploadFile({
+      fileStreamFactory:()=>Readable.from(input.bytes),
+      fileSizeFactory:()=>input.bytes.length,
+      dataItemOpts:{tags},
+      signal:input.signal,
+    });
+  }catch(error){
+    const message=error instanceof Error?error.message:String(error);
+    throw new Error(`Arweave document upload failed for ${input.fileName}: ${message}`,{cause:error});
+  }
+  if(!result?.id) throw new Error('Turbo upload returned no transaction id');
+  return {transactionId:result.id,arweaveUrl:`https://arweave.net/${result.id}`,sizeBytes:input.bytes.length,tags};
 }
