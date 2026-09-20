@@ -7,6 +7,14 @@ import { ArchiveWorker } from './worker';
 import { ControlPlaneClient, type ArchiveCommand } from './control-plane';
 import { sha256File } from './hash';
 import { uploadOriginalToArweave } from './arweave/uploader';
+import { ArchiveAnalysisService } from './analysis/service';
+import { isTwelveLabsVideo } from './providers/twelvelabs';
+import { inferMediaType } from './media-type';
+import { JevDecisionService, reviewBand } from './jev/service';
+import { AnthropicJevProvider } from './jev/anthropic-provider';
+import { JEV_QUESTIONS } from './jev/taxonomy';
+import { buildAssetState } from './schema/asset-state';
+import type { ContentAssetRecord } from './types';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -18,23 +26,96 @@ export class ArchiveDaemon {
     private db = new ArchiveDatabase(),
     private control = new ControlPlaneClient(),
     workerId = process.env.HITLOOP_ARCHIVE_WORKER_ID,
+    private analysis = new ArchiveAnalysisService(db),
+    private jev = new JevDecisionService(new AnthropicJevProvider()),
   ) {
     this.workerId = workerId || createHash('sha256').update(hostname()).digest('hex').slice(0, 24);
   }
 
   stop() { this.stopped = true; }
 
-  private async syncJobAssets(sourceId:string,jobId:string) {
-    const job=this.db.getJob(jobId); if(!job) return;
+  /** Unique content-asset ids discovered under a job's selected folder. Shared
+   * by the post-hash analysis step and the HITLOOP sync so both walk the same
+   * scope the same way. */
+  private jobAssetIds(sourceId:string,jobId:string):string[] {
+    const job=this.db.getJob(jobId); if(!job) return [];
     const prefix=job.selectedRelativePath==='.'?'':job.selectedRelativePath.replace(/\/$/,'')+'/';
     const seen=new Set<string>();
-    for(const location of this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path LIKE ?').all(sourceId,`${prefix}%`) as Array<{content_asset_id:string}>){
-      if(seen.has(location.content_asset_id)) continue; seen.add(location.content_asset_id);
-      const asset=this.db.getAsset(location.content_asset_id); if(!asset) continue;
+    for(const row of this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path LIKE ?').all(sourceId,`${prefix}%`) as Array<{content_asset_id:string}>){
+      seen.add(row.content_asset_id);
+    }
+    return Array.from(seen);
+  }
+
+  /** Analyze new video assets with TwelveLabs, then answer the six Jev
+   * questions for any asset whose observation has come back READY. Runs after
+   * hashing and before the HITLOOP sync so a synced asset carries whatever
+   * evidence/decisions are available yet. Never throws: a NAS folder with no
+   * credentials configured must still hash and sync cleanly, and a single
+   * asset's provider failure must not stop the rest of the job. */
+  private async runAnalysisAndJev(sourceId:string,jobId:string) {
+    if(!this.analysis.configured) { console.log('analysis skipped: TwelveLabs not configured'); return; }
+    const source=this.db.getSource(sourceId); if(!source) return;
+
+    for(const assetId of this.jobAssetIds(sourceId,jobId)) {
+      const asset=this.db.getAsset(assetId); if(!asset) continue;
+      const location=this.db.listAssetLocations(assetId).find(x=>x.sourceId===sourceId);
+      if(!location || !isTwelveLabsVideo(location.relativePath)) continue;
+
+      try {
+        // Idempotent: returns the existing observation without a network call
+        // when one is already SUBMITTED/INDEXING/READY, submits (or retries a
+        // prior failure) otherwise.
+        const observation=await this.analysis.analyzeVideo(assetId,path.resolve(source.rootPath,location.relativePath));
+        // Check TwelveLabs for progress unless it already reached a terminal
+        // state, so a submission from an earlier pass can reach READY here.
+        if(observation && observation.status!=='READY' && observation.status!=='FAILED') await this.analysis.advanceVideo(assetId);
+      } catch {
+        // analyzeVideo/advanceVideo already record a FAILED observation for this
+        // asset (safety invariant 9); the job must continue to the next asset.
+        continue;
+      }
+
+      await this.runJevForAsset(asset);
+    }
+  }
+
+  private async runJevForAsset(asset:ContentAssetRecord) {
+    if(!process.env.ANTHROPIC_API_KEY) { console.log('jev skipped: ANTHROPIC_API_KEY not configured'); return; }
+    if(this.db.listJevDecisions(asset.id).length) return; // already decided
+    const observation=this.db.listObservations(asset.id).find(o=>o.provider==='twelvelabs'&&o.kind==='video_understanding'&&o.status==='READY');
+    if(!observation) return; // not indexed yet; a later pass will pick it up
+
+    const locations=this.db.listAssetLocations(asset.id);
+    const primary=locations[0];
+    const assetState=buildAssetState({
+      assetId:asset.id,sha256:asset.sha256,
+      mediaType:inferMediaType(primary?.relativePath||''),
+      sourcePaths:locations.map(l=>l.relativePath),
+      observations:this.db.listObservations(asset.id).map(o=>({provider:o.provider,kind:o.kind,status:o.status,summary:o.summary})),
+    });
+
+    try {
+      for(const question of JEV_QUESTIONS) {
+        const decision=await this.jev.decide(assetState,question.question,question.choices);
+        this.db.upsertJevDecision({
+          id:decision.id,contentAssetId:asset.id,question:decision.question,choices:decision.choices,
+          selectedValue:decision.selectedValue,confidence:decision.confidence,status:decision.reviewBand,evidence:decision.evidence,
+        });
+      }
+    } catch(error) {
+      console.log(`jev failed for asset ${asset.id}: ${error instanceof Error?error.message:String(error)}`);
+    }
+  }
+
+  private async syncJobAssets(sourceId:string,jobId:string) {
+    for(const assetId of this.jobAssetIds(sourceId,jobId)) {
+      const asset=this.db.getAsset(assetId); if(!asset) continue;
       const locations=this.db.listAssetLocations(asset.id).filter(x=>x.sourceId===sourceId);
       const observations=this.db.listObservations(asset.id);
-      const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:(d.confidence??0)>0.90?'AUTO_CONFIRM':(d.confidence??0)>=0.60?'QUICK_REVIEW':'IDENTIFICATION_REQUIRED'}));
-      try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId:jobId,asset:{id:asset.id,sha256:asset.sha256,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
+      const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:reviewBand(d.confidence??0)}));
+      const mediaType=locations[0]?inferMediaType(locations[0].relativePath):undefined;
+      try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId:jobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
     }
   }
 
@@ -84,6 +165,7 @@ export class ArchiveDaemon {
     const job = worker.createJob(command.sourceId, command.relativePath);
     await this.control.updateCommand({ commandId: command.id, state: 'RUNNING', jobId: job.id });
     const result = await worker.run(job.id);
+    await this.runAnalysisAndJev(command.sourceId,job.id);
     await this.syncJobAssets(command.sourceId,job.id);
     const state = result.state === 'COMPLETE' ? 'COMPLETE' : 'FAILED';
     await this.control.updateCommand({ commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null });
@@ -101,6 +183,7 @@ export class ArchiveDaemon {
           try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:h.jobId,state:'PROCESSING',at:h.at,counters:current?.counters}); } catch {}
         }});
         const result=await worker.resume(job.id);
+        await this.runAnalysisAndJev(job.sourceId,job.id);
         await this.syncJobAssets(job.sourceId,job.id);
         try { await this.control.heartbeat({workerId:this.workerId,sourceId:job.sourceId,jobId:job.id,state:result.state==='COMPLETE'?'ONLINE':'PAUSED',at:new Date().toISOString(),counters:result.counters}); } catch {}
       } catch { /* leave durable job for next restart/manual intervention */ }

@@ -6,7 +6,7 @@ export interface VideoObservation {
   provider:'twelvelabs'; providerAssetId:string; sourceAssetId:string;
   status:'SUBMITTED'|'INDEXING'|'READY'|'FAILED'; raw?:unknown;
 }
-const VIDEO_EXTENSIONS=new Set(['.mp4','.mov','.m4v','.avi','.mkv','.webm']);
+export const VIDEO_EXTENSIONS=new Set(['.mp4','.mov','.m4v','.avi','.mkv','.webm']);
 export function isTwelveLabsVideo(filePath:string){return VIDEO_EXTENSIONS.has(path.extname(filePath).toLowerCase());}
 
 export class TwelveLabsAdapter {
