@@ -166,7 +166,6 @@ export class ArchiveWorker {
       }
     }
 
-    }
     } catch (error) {
       // Traversal failures are not completion. A disconnected/unreadable subtree must
       // leave a resumable job rather than silently losing files.
