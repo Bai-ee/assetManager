@@ -3,7 +3,7 @@ import { hostname } from 'os';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { ArchiveDatabase } from './database';
-import { ArchiveWorker } from './worker';
+import { ArchiveWorker, isFilesystemArtifact } from './worker';
 import { ControlPlaneClient, type ArchiveCommand } from './control-plane';
 import { sha256File } from './hash';
 import { uploadOriginalToArweave } from './arweave/uploader';
@@ -47,6 +47,17 @@ export class ArchiveDaemon {
     return Array.from(seen);
   }
 
+  /** True when every known location of this asset is an AppleDouble `._*` or
+   * `.DS_Store` filesystem artifact. Catches stale content_assets hashed by a
+   * worker run from before the discovery filter existed — their basename
+   * still carries a real extension (e.g. `._clip.mp4`), so the video-extension
+   * check alone would still try to submit their garbage bytes. */
+  private isStaleArtifactAsset(assetId:string):boolean {
+    const locations=this.db.listAssetLocations(assetId);
+    if(!locations.length) return false;
+    return locations.every(l=>isFilesystemArtifact(path.basename(l.relativePath)));
+  }
+
   /** Analyze new video assets with TwelveLabs, then answer the six Jev
    * questions for any asset whose observation has come back READY. Runs after
    * hashing and before the HITLOOP sync so a synced asset carries whatever
@@ -59,6 +70,7 @@ export class ArchiveDaemon {
 
     for(const assetId of this.jobAssetIds(sourceId,jobId)) {
       const asset=this.db.getAsset(assetId); if(!asset) continue;
+      if(this.isStaleArtifactAsset(assetId)) continue;
       const location=this.db.listAssetLocations(assetId).find(x=>x.sourceId===sourceId);
       if(!location || !isTwelveLabsVideo(location.relativePath)) continue;
 
@@ -70,9 +82,12 @@ export class ArchiveDaemon {
         // Check TwelveLabs for progress unless it already reached a terminal
         // state, so a submission from an earlier pass can reach READY here.
         if(observation && observation.status!=='READY' && observation.status!=='FAILED') await this.analysis.advanceVideo(assetId);
-      } catch {
+      } catch(error) {
         // analyzeVideo/advanceVideo already record a FAILED observation for this
         // asset (safety invariant 9); the job must continue to the next asset.
+        // The daemon used to swallow this silently, which is what made the
+        // 413/404 failures on hpit03_finals invisible.
+        console.log(`analysis failed ${assetId.slice(0,8)} ${location.relativePath}: ${error instanceof Error?error.message:String(error)}`);
         continue;
       }
 
@@ -139,11 +154,17 @@ export class ArchiveDaemon {
     for(const row of rows) {
       const assetId=row.content_asset_id;
       const asset=this.db.getAsset(assetId); if(!asset) continue;
-
-      try { await this.analysis.advanceVideo(assetId); } catch { /* recorded as FAILED; still worth syncing below */ }
-      await this.runJevForAsset(asset);
+      if(this.isStaleArtifactAsset(assetId)) continue;
 
       const location=this.db.listAssetLocations(assetId)[0];
+      try { await this.analysis.advanceVideo(assetId); }
+      catch(error) {
+        // Recorded as FAILED by advanceVideo; still worth syncing below so
+        // HITLOOP sees the failure instead of a silently stuck SUBMITTED row.
+        console.log(`analysis failed ${assetId.slice(0,8)} ${location?.relativePath??'(no known location)'}: ${error instanceof Error?error.message:String(error)}`);
+      }
+      await this.runJevForAsset(asset);
+
       if(!location) continue; // no known source to sync this asset under yet
       await this.pushAssetSync(location.sourceId,undefined,assetId);
     }

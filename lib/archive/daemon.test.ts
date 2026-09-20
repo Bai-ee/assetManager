@@ -194,6 +194,50 @@ test('a TwelveLabs submission failure is recorded but does not abort the job', a
   await fs.rm(f.dir, { recursive: true, force: true });
 });
 
+test('a stale AppleDouble asset (hashed before the discovery filter existed) is never submitted to TwelveLabs', async () => {
+  const f = await fixture();
+
+  const control = fakeControl();
+  const fakeTwelveLabs: any = {
+    configured: true,
+    submitVideo: async () => { throw new Error('must not be called for a stale AppleDouble asset'); },
+    getAsset: async () => { throw new Error('must not be called for a stale AppleDouble asset'); },
+  };
+  const analysis = new ArchiveAnalysisService(f.db, fakeTwelveLabs);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  // Simulate the state left by a worker run from before the discovery filter
+  // existed: a stale 368-byte AppleDouble asset hashed under six `._*.mp4`
+  // locations (real incident on hpit03_finals). The current discovery filter
+  // would never produce these rows again, but a re-scan of the same source
+  // still finds them in file_locations — and their basename still carries a
+  // real video extension, so the extension check alone would still submit
+  // 368 bytes of garbage as if it were a video.
+  const staleAssetId = 'stale-appledouble-sha256';
+  f.db.insertAsset({ id: staleAssetId, sha256: staleAssetId, sizeBytes: 368, createdAt: new Date().toISOString(), state: 'QUEUED' });
+  for (const name of ['a.mp4', 'b.mp4']) {
+    f.db.upsertLocation({
+      id: `loc-${name}`, sourceId: source.id, relativePath: `._${name}`, sizeBytes: 368, modifiedAtMs: Date.now(),
+      discoveredAt: new Date().toISOString(), lastSeenAt: new Date().toISOString(), state: 'HASHED', contentAssetId: staleAssetId,
+    });
+  }
+
+  await (daemon as any).execute(collectionCommand('cmd1', source.id));
+
+  assert.equal(f.db.listObservations(staleAssetId).length, 0);
+
+  // The asset still syncs (every job asset does) but carries no analysis.
+  const staleSync = control.synced.find((s: any) => s.asset.id === staleAssetId);
+  assert.ok(staleSync);
+  assert.equal(staleSync.asset.decisions.length, 0);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
 test('sweepPendingAnalysis advances an INDEXING row to READY, runs Jev, and syncs once', async () => {
   const f = await fixture();
   await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
