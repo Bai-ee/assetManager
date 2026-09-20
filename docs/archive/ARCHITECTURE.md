@@ -139,6 +139,33 @@ Jev should expose candidate choices and confidence/probability where supported. 
 
 Physical implementation may use transactions/manifests rather than filesystem semantics. Logical structure and references must remain reconstructable without HITLOOP.
 
+## Arweave upload streaming
+
+`lib/archive/arweave/uploader.ts` streams the original file to Turbo
+(`turbo.uploadFile({fileStreamFactory, fileSizeFactory, ...})`) instead of
+reading it into a `Buffer` first. `fileStreamFactory` returns a fresh
+`fs.createReadStream(filePath)` on every call — required because the Turbo
+node signer opens the file twice (once to size/sign, once to hash and send)
+and a shared/already-consumed stream would silently truncate the upload.
+`fileSizeFactory` returns the size from `fs.stat`, so the byte size is never
+learned by reading the file.
+
+Memory ceiling: the process now holds only the SDK's internal chunk/stream
+buffers (a few MB at a time), not the whole original, so a multi-GB video
+upload no longer scales worker memory with file size. The daemon's
+re-hash-before-upload invariant (`lib/archive/daemon.ts`, `UPLOAD_ASSET_ARWEAVE`)
+is unchanged and still runs before the uploader is called — the uploader
+itself never re-derives or re-checks the sha256, it only carries the
+daemon-computed hash into the upload tags.
+
+The Turbo client is isolated behind `TurboUploadClient` /
+`createTurboClient()` so tests inject a fake client and never construct a
+real wallet/signer. Upload failures (a non-2xx from the Turbo service, an
+aborted `signal`, or the read stream erroring mid-upload) are caught and
+re-thrown as a single clear `Error` naming the archive name and sha256, with
+the original error attached as `cause` — there is no silent partial success;
+the daemon marks the command `FAILED` and the source file stays reviewable.
+
 ## Safety and invariants
 
 1. Source bytes are read-only.
