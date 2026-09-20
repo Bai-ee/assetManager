@@ -138,7 +138,7 @@ export class ArchiveWorker {
 
         const now = new Date().toISOString();
         const location: FileLocationRecord = {
-          id, sourceId: source.id, relativePath, sizeBytes: stat.size, modifiedAtMs: stat.mtimeMs,
+          id, sourceId: source.id, relativePath, sizeBytes: Number(stat.size), modifiedAtMs: Number(stat.mtimeMs),
           discoveredAt: prior?.discoveredAt || now, lastSeenAt: now, state: 'HASHING'
         };
         this.store.upsertLocation(location);
@@ -155,7 +155,7 @@ export class ArchiveWorker {
           this.store.upsertLocation({ ...this.store.getLocation(id)!, contentAssetId: existing.id, state: 'DUPLICATE' });
           this.store.bumpJob(jobId, 'duplicates');
         } else {
-          this.store.insertAsset({ id: hash, sha256: hash, sizeBytes: stat.size, createdAt: now, state: 'QUEUED' });
+          this.store.insertAsset({ id: hash, sha256: hash, sizeBytes: Number(stat.size), createdAt: now, state: 'QUEUED' });
           this.store.upsertLocation({ ...this.store.getLocation(id)!, contentAssetId: hash, state: 'HASHED' });
         }
         this.store.bumpJob(jobId, 'hashed');
