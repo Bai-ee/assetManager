@@ -6,7 +6,7 @@ import { ArchiveDatabase } from './database';
 import { ArchiveWorker, isFilesystemArtifact } from './worker';
 import { ControlPlaneClient, type ArchiveCommand } from './control-plane';
 import { sha256File } from './hash';
-import { uploadOriginalToArweave } from './arweave/uploader';
+import { uploadOriginalToArweave, uploadDocumentToArweave } from './arweave/uploader';
 import { ArchiveAnalysisService } from './analysis/service';
 import { isTwelveLabsVideo } from './providers/twelvelabs';
 import { inferMediaType } from './media-type';
@@ -40,6 +40,7 @@ export class ArchiveDaemon {
     private analysis = new ArchiveAnalysisService(db),
     private jev = new JevDecisionService(new AnthropicJevProvider()),
     private uploadOriginal = uploadOriginalToArweave,
+    private uploadDocument = uploadDocumentToArweave,
   ) {
     this.workerId = workerId || createHash('sha256').update(hostname()).digest('hex').slice(0, 24);
   }
@@ -211,13 +212,61 @@ export class ArchiveDaemon {
     }
   }
 
+  /** UPLOAD_JSON has no sourceId and touches no filesystem: the worker just
+   * uploads bytes HITLOOP already assembled (an archive record, a collection
+   * manifest, or the static viewer HTML) because the Arweave wallet lives
+   * only here. Self-contained CLAIMED->RUNNING->COMPLETE/FAILED so a bad
+   * command never needs a registered source to report failure cleanly. */
+  private async executeUploadJson(command: ArchiveCommand) {
+    try {
+      if (command.kind !== 'archive-record' && command.kind !== 'collection-manifest' && command.kind !== 'viewer') {
+        throw new Error(`Invalid UPLOAD_JSON kind: ${String(command.kind)}`);
+      }
+      if (!command.fileName) throw new Error('UPLOAD_JSON command missing fileName');
+      if (!command.contentType) throw new Error('UPLOAD_JSON command missing contentType');
+      if (command.payload === undefined || command.payload === null) throw new Error('UPLOAD_JSON command missing payload');
+
+      await this.control.updateCommand({ commandId: command.id, state: 'RUNNING' });
+
+      // 'viewer' carries a pre-rendered HTML string through as-is; the two
+      // JSON kinds are pretty-printed the same way a human inspecting the
+      // permanent Arweave record would expect.
+      const bytes = command.kind === 'viewer'
+        ? Buffer.from(String(command.payload), 'utf8')
+        : Buffer.from(JSON.stringify(command.payload, null, 2), 'utf8');
+
+      const uploaded = await this.uploadDocument({
+        bytes,
+        fileName: command.fileName,
+        contentType: command.contentType,
+        tags: command.tags || [],
+      });
+
+      await this.control.updateCommand({
+        commandId: command.id,
+        state: 'COMPLETE',
+        result: { ...uploaded, kind: command.kind, fileName: command.fileName, refs: command.refs || {} },
+      });
+    } catch (error) {
+      await this.control.updateCommand({ commandId: command.id, state: 'FAILED', error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
   private async execute(command: ArchiveCommand) {
     await this.control.updateCommand({ commandId: command.id, state: 'CLAIMED' });
-    const source = this.db.getSource(command.sourceId);
-    if (!source) throw new Error(`Unknown source ${command.sourceId}`);
+
+    if (command.type === 'UPLOAD_JSON') {
+      await this.executeUploadJson(command);
+      return;
+    }
+
+    if (!command.sourceId) throw new Error(`Command ${command.id} missing sourceId`);
+    const sourceId = command.sourceId; // narrowed const: stays 'string' inside closures below, unlike command.sourceId
+    const source = this.db.getSource(sourceId);
+    if (!source) throw new Error(`Unknown source ${sourceId}`);
 
     if (command.type === 'UPLOAD_ASSET_ARWEAVE') {
-      if(!command.expectedSha256||!command.collectionId||!command.archiveName) throw new Error('Incomplete Arweave upload command');
+      if(!command.expectedSha256||!command.collectionId||!command.archiveName||!command.relativePath) throw new Error('Incomplete Arweave upload command');
       const root=path.resolve(source.rootPath);
       const target=path.resolve(root,command.relativePath);
       const relative=path.relative(root,target);
@@ -225,7 +274,7 @@ export class ArchiveDaemon {
       // Lane 2 only: an UPLOAD_ASSET_ARWEAVE command for this asset only
       // exists once HITLOOP's human review confirmed it, so its arrival is
       // itself the REVIEWED signal (see intake.ts markIntakeReviewed).
-      const cloudIntakeId=command.sourceId===this.cloudIntakeSourceId?resolveIntakeIdFromRelativePath(command.relativePath):null;
+      const cloudIntakeId=sourceId===this.cloudIntakeSourceId?resolveIntakeIdFromRelativePath(command.relativePath):null;
       if(cloudIntakeId) await markIntakeReviewed(this.control,this.workerId,cloudIntakeId);
       // Re-hash immediately before permanent upload. The approved bytes must be
       // exactly the bytes that were reviewed.
@@ -233,7 +282,7 @@ export class ArchiveDaemon {
       if(currentHash!==command.expectedSha256) throw new Error('Source bytes changed after approval; re-review required');
       await this.control.updateCommand({commandId:command.id,state:'RUNNING'});
       const uploaded=await this.uploadOriginal({filePath:target,archiveName:command.archiveName,contentType:command.contentType,sha256:currentHash,collectionId:command.collectionId});
-      await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId,collectionId:command.collectionId,archiveName:command.archiveName,sha256:currentHash,contentType:command.contentType||null,sourceId:command.sourceId,relativePath:command.relativePath}});
+      await this.control.updateCommand({commandId:command.id,state:'COMPLETE',result:{...uploaded,contentAssetId:command.contentAssetId,collectionId:command.collectionId,archiveName:command.archiveName,sha256:currentHash,contentType:command.contentType||null,sourceId,relativePath:command.relativePath}});
       // Only after the command is durably COMPLETE: ARCHIVED, purge the
       // Firebase object, delete the local scratch copy (D3/D4). Never before.
       if(cloudIntakeId&&this.cloudIntakeRootPath) await archiveAndPurgeIntake({control:this.control,workerId:this.workerId,intakeId:cloudIntakeId,root:this.cloudIntakeRootPath});
@@ -256,17 +305,17 @@ export class ArchiveDaemon {
         const job = this.db.getJob(h.jobId);
         try {
           await this.control.heartbeat({
-            workerId: this.workerId, sourceId: command.sourceId, jobId: h.jobId,
+            workerId: this.workerId, sourceId, jobId: h.jobId,
             state: 'PROCESSING', at: h.at, counters: job?.counters,
           });
         } catch { /* processing must survive control-plane telemetry failure */ }
       },
     });
-    const job = worker.createJob(command.sourceId, command.relativePath);
+    const job = worker.createJob(sourceId, command.relativePath);
     await this.control.updateCommand({ commandId: command.id, state: 'RUNNING', jobId: job.id });
     const result = await worker.run(job.id);
-    await this.runAnalysisAndJev(command.sourceId,job.id);
-    await this.syncJobAssets(command.sourceId,job.id);
+    await this.runAnalysisAndJev(sourceId,job.id);
+    await this.syncJobAssets(sourceId,job.id);
     const state = result.state === 'COMPLETE' ? 'COMPLETE' : 'FAILED';
     await this.control.updateCommand({ commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null });
   }

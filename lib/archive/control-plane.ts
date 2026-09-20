@@ -7,18 +7,39 @@ export interface WorkerHeartbeat {
   counters?: { discovered: number; hashed: number; duplicates: number; failed: number };
 }
 
+export interface ArchiveCommandTag { name: string; value: string; }
+
+// Echoed verbatim into the UPLOAD_JSON result so HITLOOP can relate the
+// uploaded document back to the record/collection it documents without the
+// worker knowing anything about those domain concepts.
+export interface ArchiveCommandRefs {
+  contentAssetId?: string;
+  collectionId?: string;
+  version?: string | number;
+  previousTransactionId?: string;
+}
+
 export interface ArchiveCommand {
   id: string;
-  type: 'PROCESS_COLLECTION' | 'LIST_DIRECTORY' | 'UPLOAD_ASSET_ARWEAVE';
+  type: 'PROCESS_COLLECTION' | 'LIST_DIRECTORY' | 'UPLOAD_ASSET_ARWEAVE' | 'UPLOAD_JSON';
   workerId: string;
-  sourceId: string;
-  relativePath: string;
+  // Required for every command type except UPLOAD_JSON, which uploads bytes
+  // HITLOOP already has in hand and never touches a registered source's
+  // filesystem.
+  sourceId?: string;
+  relativePath?: string;
   contentAssetId?: string;
   collectionId?: string;
   archiveName?: string;
   contentType?: string;
   expectedSha256?: string;
   state: 'QUEUED';
+  // UPLOAD_JSON fields only.
+  kind?: 'archive-record' | 'collection-manifest' | 'viewer';
+  fileName?: string;
+  payload?: unknown;
+  tags?: ArchiveCommandTag[];
+  refs?: ArchiveCommandRefs;
 }
 
 export interface CommandUpdate {
