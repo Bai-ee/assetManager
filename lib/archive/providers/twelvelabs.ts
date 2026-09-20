@@ -157,8 +157,12 @@ export class TwelveLabsAdapter {
         // byte range, and a consumed stream cannot be replayed.
         const chunkStream=createReadStream(filePath,{start:range.start,end:range.end});
         const body=Readable.toWeb(chunkStream) as unknown as ReadableStream;
+        // S3-style presigned PUTs reject chunked transfer encoding (HTTP 501).
+        // An explicit Content-Length makes Node's fetch send the stream as a
+        // fixed-length body instead.
+        const contentLength=String(range.end-range.start+1);
         response=await this.fetchImpl(entry.url,{
-          method:'PUT',headers:uploadHeaders,body,duplex:'half',signal:AbortSignal.timeout(120_000),
+          method:'PUT',headers:{...(uploadHeaders||{}),'content-length':contentLength},body,duplex:'half',signal:AbortSignal.timeout(600_000),
         } as RequestInit & {duplex:'half'});
       }catch(error){
         if(attempt===MAX_CHUNK_ATTEMPTS) throw error instanceof Error?error:new Error(String(error));
