@@ -113,7 +113,18 @@ export class ArchiveDaemon {
         catch { /* retry naturally on daemon restart; processing remains local-first */ }
       }
     }
+    // An idle worker must still be visible. The control plane only creates the
+    // worker record from a heartbeat, so without this an idle daemon shows as
+    // "waiting for worker" and the /archive browser has no worker to target.
+    const idleHeartbeat = async () => {
+      for (const source of this.db.listSources()) {
+        try { await this.control.heartbeat({ workerId:this.workerId, sourceId:source.id, state:'ONLINE', at:new Date().toISOString() }); } catch {}
+      }
+    };
+    await idleHeartbeat();
+    let pollsSinceHeartbeat = 0;
     while (!this.stopped) {
+      if (++pollsSinceHeartbeat >= 12) { pollsSinceHeartbeat = 0; await idleHeartbeat(); }
       try {
         const commands = await this.control.pollCommands(this.workerId);
         for (const command of commands) {
