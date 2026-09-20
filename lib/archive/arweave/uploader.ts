@@ -1,4 +1,4 @@
-import { createReadStream } from 'fs';
+import { readFile } from 'fs/promises';
 import { stat } from 'fs/promises';
 import { ArweaveSigner, TurboFactory } from '@ardrive/turbo-sdk';
 
@@ -11,7 +11,7 @@ function wallet(){
 export async function uploadOriginalToArweave(input:{filePath:string;archiveName:string;contentType?:string;sha256:string;collectionId:string}){
   const info=await stat(input.filePath);
   if(!info.isFile()) throw new Error('Arweave source is not a file');
-  const turbo=TurboFactory.authenticated({signer:new ArweaveSigner(wallet()),config:{gatewayUrl:'https://turbo.ardrive.io',uploadUrl:'https://turbo.ardrive.io'}});
+  const turbo=TurboFactory.authenticated({signer:new ArweaveSigner(wallet())});
   const tags=[
     {name:'Content-Type',value:input.contentType||'application/octet-stream'},
     {name:'File-Name',value:input.archiveName},
@@ -21,9 +21,10 @@ export async function uploadOriginalToArweave(input:{filePath:string;archiveName
     {name:'SHA-256',value:input.sha256},
     {name:'Collection-ID',value:input.collectionId},
   ];
-  // Turbo SDK accepts Node readable streams; originals never need to be loaded
-  // wholly into memory and are never modified.
-  const result=await turbo.upload({data:createReadStream(input.filePath),dataItemOpts:{tags},turboOpts:{payment:{token:'arweave'}}});
+  // POC path: the installed Turbo SDK type accepts Buffer, not Node ReadStream.
+  // Keep this limited to small validation files until the large-file path is verified.
+  const data=await readFile(input.filePath);
+  const result=await turbo.upload({data,dataItemOpts:{tags}});
   if(!result?.id) throw new Error('Turbo upload returned no transaction id');
   return {transactionId:result.id,arweaveUrl:`https://arweave.net/${result.id}`,sizeBytes:info.size,tags};
 }
