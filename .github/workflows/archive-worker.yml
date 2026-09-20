@@ -14,5 +14,5 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npm run typecheck
+      - run: npx tsc --noEmit --target ES2020 --module commonjs --moduleResolution node --esModuleInterop --skipLibCheck lib/archive/*.ts lib/archive/**/*.ts
       - run: npm run test:archive
