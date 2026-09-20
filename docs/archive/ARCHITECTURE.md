@@ -52,6 +52,8 @@ Bai-ee/port_2026. Private /archive UI for source/job status, collection review, 
 ### External intelligence
 TwelveLabs is the primary POC video-understanding provider. Evidence comes from Pegasus text generation (`analyzeAsset`, TwelveLabs API `/analyze`) run directly on the uploaded asset once it reaches "ready" — its only precondition, no search index required. The Marengo search index (`indexAsset`/indexed-assets) is optional and unused by the analysis/Jev path; it exists only for a future search feature. Image/audio/document adapters feed the same normalized evidence contract. Jev receives compact structured evidence — including the Pegasus-generated summary — and makes typed taxonomy decisions; it does not receive raw media.
 
+Upload: files at or under `DEFAULT_MULTIPART_THRESHOLD_BYTES` (50 MB) go through TwelveLabs' direct `/assets` upload; anything larger uses the chunked `/assets/multipart-uploads` session (streamed from disk in bounded-concurrency chunks, never buffered whole) — a live run hit HTTP 413 on a 144 MB direct upload despite TwelveLabs' docs claiming a 200 MB limit.
+
 ### Arweave
 Permanent public storage for approved originals, archive records, manifests, relationships, analysis provenance, and the standalone archive dashboard.
 

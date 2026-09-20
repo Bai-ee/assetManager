@@ -15,7 +15,9 @@ function locationId(sourceId: string, relativePath: string): string {
 // SMB/Finder artifacts, not archive content. Skipping them at discovery keeps
 // them out of hashing, TwelveLabs, Jev, and the human review queue entirely —
 // a real NAS folder run surfaced six of these sharing one 368-byte asset.
-function isFilesystemArtifact(name: string): boolean {
+// Exported so the daemon can also recognize a location hashed before this
+// filter existed (a stale row from an earlier run).
+export function isFilesystemArtifact(name: string): boolean {
   return name.startsWith('._') || name === '.DS_Store';
 }
 
