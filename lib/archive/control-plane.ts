@@ -71,7 +71,7 @@ export class ControlPlaneClient {
     if (!response.ok) throw new Error(`HITLOOP heartbeat failed: ${response.status}`);
   }
 
-  async registerSource(payload: {workerId:string;sourceId:string;label:string;state?:string}): Promise<void> {
+  async registerSource(payload: {workerId:string;sourceId:string;label:string;state?:string;kind?:string}): Promise<void> {
     if (!this.configured) return;
     const response=await fetch(new URL('/api/archive/worker/sources',this.baseUrl),{
       method:'POST',headers:this.headers(true),body:JSON.stringify(payload),signal:AbortSignal.timeout(10_000),

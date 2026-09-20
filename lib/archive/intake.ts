@@ -40,7 +40,8 @@ export async function ensureCloudIntakeSource(
   const worker = new ArchiveWorker(db);
   const source = await worker.registerSource(CLOUD_INTAKE_SOURCE_LABEL, root);
   try {
-    await control.registerSource({ workerId, sourceId: source.id, label: source.label, state: source.state });
+    // `kind` lets /archive hide this scratch source from Browse / Process Folder.
+    await control.registerSource({ workerId, sourceId: source.id, label: source.label, state: source.state, kind: 'cloud-intake' });
   } catch {
     // Retried on the next daemon start / registration sweep; the local source
     // is already durable and usable regardless of HITLOOP visibility.
