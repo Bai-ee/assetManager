@@ -7,7 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "scan": "tsx lib/scanner/cli.ts"
+    "scan": "tsx lib/scanner/cli.ts",
+    "archive:scan": "tsx lib/archive/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test:archive": "TESTS=$(find lib/archive -name '*.test.ts' | sort) && test -n \"$TESTS\" && tsx --test $TESTS",
+    "archive:worker": "tsx lib/archive/daemon.ts",
+    "archive:source": "tsx lib/archive/source-cli.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
@@ -19,7 +24,9 @@
     "recharts": "^2.12.0",
     "date-fns": "^3.3.0",
     "crypto-js": "^4.2.0",
-    "zustand": "^4.5.0"
+    "zustand": "^4.5.0",
+    "better-sqlite3": "^11.7.0",
+    "@ardrive/turbo-sdk": "^1.29.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
@@ -36,6 +43,7 @@
     "class-variance-authority": "^0.7.0",
     "@radix-ui/react-slot": "^1.0.2",
     "@radix-ui/react-label": "^2.0.2",
-    "tsx": "^4.7.0"
+    "tsx": "^4.7.0",
+    "@types/better-sqlite3": "^7.6.12"
   }
 }
