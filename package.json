@@ -13,7 +13,12 @@
     "test:archive": "TESTS=$(find lib/archive -name '*.test.ts' | sort) && test -n \"$TESTS\" && tsx --test $TESTS",
     "archive:worker": "tsx --env-file-if-exists=.env.local lib/archive/daemon.ts",
     "archive:source": "tsx --env-file-if-exists=.env.local lib/archive/source-cli.ts",
-    "archive:twelvelabs-index": "tsx --env-file-if-exists=.env.local lib/archive/twelvelabs-index-cli.ts"
+    "archive:twelvelabs-index": "tsx --env-file-if-exists=.env.local lib/archive/twelvelabs-index-cli.ts",
+    "discogs:publish": "tsx --env-file-if-exists=.env.local lib/discogs/publish-cli.ts",
+    "discogs:check": "node --experimental-strip-types --env-file-if-exists=.env.local lib/discogs/check-cli.ts",
+    "discogs:doctor": "tsx --env-file-if-exists=.env.local lib/discogs/doctor-cli.ts",
+    "discogs:ingest": "tsx --env-file-if-exists=.env.local lib/discogs/ingest-cli.ts",
+    "test:discogs": "tsx --test lib/discogs/*.test.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
