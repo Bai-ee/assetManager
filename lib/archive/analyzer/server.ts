@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
+import type { AnalyzerPlugin } from './plugin';
 import { CONTENT_TYPES } from './stage';
 import { firstExisting, type ReadOnlyStore, type SourceInfo } from './store';
 import { OpsManager, handleOpsRoute } from './fileops';
@@ -49,6 +50,8 @@ export interface ServerDeps {
   /** Copy/move engine (defaults to a fresh OpsManager per server). */
   ops?: OpsManager;
   /** Live cost estimate for a selection (dry run, no model calls). */
+  /** Generic plugins; a pathname under a plugin routePrefix is delegated to plugin.route. */
+  plugins?: AnalyzerPlugin[];
   estimate?: (input: { sourceId: string; paths: string[]; promptVersion?: string; model?: string; batch?: boolean }) => Promise<unknown>;
 }
 
@@ -110,6 +113,22 @@ export function createAnalyzerServer(deps: ServerDeps): http.Server {
       }
       const r = handleOpsRoute(ops, id => deps.store.getSource?.(id), req.method || 'GET', pathname, body);
       return r ? send(r.status, r.body) : send(404, 'not found');
+    }
+    const plugin = (deps.plugins ?? []).find(p => p.routePrefix && p.route && pathname.startsWith(p.routePrefix));
+    if (plugin) {
+      if (origin && !ALLOWED_ORIGINS.has(origin)) return send(403, 'forbidden');
+      let body: unknown;
+      if (req.method === 'POST') {
+        try {
+          const chunks: Buffer[] = []; let n = 0;
+          for await (const c of req) { n += (c as Buffer).length; if (n > 1_000_000) return send(413, { ok: false, error: 'body too large' }); chunks.push(c as Buffer); }
+          body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+        } catch { return send(400, { ok: false, error: 'invalid JSON body' }); }
+      }
+      try {
+        const r = await plugin.route!({ method: req.method || 'GET', pathname, url, body }, { getSource: id => deps.store.getSource?.(id), listSources: sources });
+        return r ? send(r.status, r.body as string | object) : send(404, 'not found');
+      } catch (e) { return send(500, { ok: false, error: e instanceof Error ? e.message : String(e) }); }
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(405, 'method not allowed');
     if (pathname === '/nas/status') return send(200, status());

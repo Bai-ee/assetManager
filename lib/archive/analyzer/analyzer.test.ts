@@ -232,7 +232,7 @@ test('control: heartbeat carries capabilities + thumb base (fake fetch)', async 
   const c = new AnalyzerControl('https://h.example', 't', 'w-analyzer', (async (u: any, init: any) => { url = String(u); body = JSON.parse(init.body); return new Response('{}', { status: 200 }); }) as typeof fetch);
   await c.heartbeat('s1', 'ONLINE');
   assert.equal(url, 'https://h.example/api/archive/worker/heartbeat');
-  assert.deepEqual(body.capabilities, ['ANALYZE_FACETS', 'STAGE_FOR_PUBLISH', 'CANCEL_JOB']);
+  assert.deepEqual(body.capabilities, ['ANALYZE_FACETS', 'STAGE_FOR_PUBLISH', 'CANCEL_JOB', 'COLLECT_BATCHES']);
   assert.equal(body.localThumbBase, 'http://127.0.0.1:8777');
   assert.equal(body.workerId, 'w-analyzer');
 });

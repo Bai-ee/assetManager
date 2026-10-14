@@ -12,7 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test:archive": "TESTS=$(find lib/archive -name '*.test.ts' | sort) && test -n \"$TESTS\" && tsx --test $TESTS",
     "archive:worker": "tsx --env-file-if-exists=.env.local lib/archive/daemon.ts",
-    "archive:analyzer": "tsx --env-file-if-exists=.env.local lib/archive/analyzer/daemon.ts",
+    "archive:analyzer": "tsx --env-file-if-exists=.env.local lib/discogs/analyzer-entry.ts",
     "archive:analyzer:dates": "tsx lib/archive/analyzer/backfill-dates.ts",
     "archive:source": "tsx --env-file-if-exists=.env.local lib/archive/source-cli.ts",
     "archive:twelvelabs-index": "tsx --env-file-if-exists=.env.local lib/archive/twelvelabs-index-cli.ts",

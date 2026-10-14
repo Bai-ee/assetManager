@@ -92,10 +92,27 @@ function normalize(raw: Record<string, unknown>, fileName: string, model: string
   };
 }
 
+/** Model a read will use (same precedence as readLabel). */
+export function resolveLabelModel(model?: string): string {
+  return model || process.env.DISCOGS_VISION_MODEL || DEFAULT_MODEL;
+}
+
+/** Cache file for one jpeg + model. Needs no API key and makes no model call. */
+export function labelCacheFile(jpegPath: string, cacheDir: string, model?: string): string {
+  const bytes = fs.readFileSync(jpegPath);
+  const hash = createHash('sha256').update(bytes).update('\0').update(resolveLabelModel(model)).digest('hex');
+  return path.join(cacheDir, `label-${hash}.json`);
+}
+
+/** True when readLabel would answer this jpeg from its cache (free). */
+export function isLabelCached(jpegPath: string, cacheDir: string, model?: string): boolean {
+  return fs.existsSync(labelCacheFile(jpegPath, cacheDir, model));
+}
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function readLabel(jpegPath: string, fileName: string, opts: ReadLabelOptions = {}): Promise<LabelRead> {
-  const model = opts.model || process.env.DISCOGS_VISION_MODEL || DEFAULT_MODEL;
+  const model = resolveLabelModel(opts.model);
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('Label reader is not configured: ANTHROPIC_API_KEY is missing');
   const fetchImpl = opts.fetchImpl ?? fetch;

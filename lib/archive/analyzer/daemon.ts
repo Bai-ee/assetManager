@@ -1,6 +1,8 @@
 import * as path from 'path';
 import { AnalyzerControl, type Cmd } from './control';
+import type { AnalyzerPlugin } from './plugin';
 import { HOME_DIR, runAnalyze } from './analyze';
+import { collectPersistedBatches } from './collect';
 import { prepareMedia } from './media';
 import { makeVision } from './vision';
 import { createAnalyzerServer, PORT } from './server';
@@ -21,8 +23,13 @@ export class AnalyzerDaemon {
   constructor(
     private control: AnalyzerControl,
     private store: Pick<ReadOnlyStore, 'listSources' | 'getSource' | 'knownFile'>,
-    private opts: { fetchImpl?: typeof fetch; apiKey?: string; handlers?: { analyze?: typeof runAnalyze; stage?: typeof runStage } } = {},
-  ) {}
+    private opts: { fetchImpl?: typeof fetch; apiKey?: string; handlers?: { analyze?: typeof runAnalyze; stage?: typeof runStage; collect?: typeof collectPersistedBatches }; plugins?: AnalyzerPlugin[]; collectOnStart?: boolean } = {},
+  ) {
+    for (const p of opts.plugins ?? []) for (const t of p.commandTypes) this.pluginByType.set(t, p);
+    this.control.setExtraCommandTypes?.(Array.from(this.pluginByType.keys()));
+  }
+
+  private pluginByType = new Map<string, AnalyzerPlugin>();
 
   stop() { this.stopped = true; }
   isCancelled = (id: string) => this.cancelled.has(id);
@@ -43,7 +50,7 @@ export class AnalyzerDaemon {
         const hit = target ? [target] : [this.activeId, ...this.queue.map(q => q.id)].filter((x): x is string => !!x);
         hit.forEach(id => this.cancelled.add(id));
         await this.control.update({ commandId: cmd.id, state: 'COMPLETE', result: { cancelled: hit } }).catch(() => undefined);
-      } else if (cmd.type === 'ANALYZE_FACETS' || cmd.type === 'STAGE_FOR_PUBLISH') {
+      } else if (cmd.type === 'ANALYZE_FACETS' || cmd.type === 'STAGE_FOR_PUBLISH' || cmd.type === 'COLLECT_BATCHES' || this.pluginByType.has(cmd.type)) {
         this.queue.push(cmd); this.queuedIds.add(cmd.id);
       } else {
         await this.control.update({ commandId: cmd.id, state: 'FAILED', error: `Unsupported command type ${cmd.type}` }).catch(() => undefined);
@@ -65,6 +72,14 @@ export class AnalyzerDaemon {
         });
         if (result.cancelled) await this.control.update({ commandId: cmd.id, state: 'FAILED', error: 'CANCELLED by owner', result });
         else await this.control.update({ commandId: cmd.id, state: 'COMPLETE', result });
+      } else if (cmd.type === 'COLLECT_BATCHES') {
+        await this.control.update({ commandId: cmd.id, state: 'COMPLETE', result: await this.collect() });
+      } else if (this.pluginByType.has(cmd.type)) {
+        const out = await this.pluginByType.get(cmd.type)!.run(cmd, {
+          update: u => this.control.update(u), isCancelled: this.isCancelled, getSource: id => this.store.getSource(id),
+        });
+        if (out.cancelled) await this.control.update({ commandId: cmd.id, state: 'FAILED', error: 'CANCELLED by owner', result: out.result });
+        else await this.control.update({ commandId: cmd.id, state: 'COMPLETE', result: out.result });
       } else {
         const result = await (this.opts.handlers?.stage ?? runStage)(cmd, { store: this.store, control: this.control, fetchImpl: this.opts.fetchImpl });
         await this.control.update({ commandId: cmd.id, state: 'COMPLETE', result });
@@ -76,9 +91,21 @@ export class AnalyzerDaemon {
     }
   }
 
+  /** Collect-only for persisted batches (no folder walk, never submits). Runs on the serial worker. */
+  collect() {
+    return (this.opts.handlers?.collect ?? collectPersistedBatches)({
+      store: this.store, control: this.control, prepare: prepareMedia,
+      apiKey: this.opts.apiKey ?? process.env.ANTHROPIC_API_KEY, fetchImpl: this.opts.fetchImpl,
+    });
+  }
+
   async run(pollMs = 3000, heartbeatMs = 30_000) {
     let lastBeat = 0;
     const worker = (async () => {
+      if (this.opts.collectOnStart) {
+        try { console.log('collect on start:', JSON.stringify((await this.collect()).batches)); }
+        catch (e) { console.error('collect on start failed:', e instanceof Error ? e.message : e); }
+      }
       while (!this.stopped) {
         const next = this.queue.shift();
         if (next) await this.runOne(next); else await sleep(250);
@@ -93,13 +120,13 @@ export class AnalyzerDaemon {
   }
 }
 
-if (process.argv[1]?.endsWith('analyzer/daemon.ts')) {
+export function startAnalyzer({ plugins = [] }: { plugins?: AnalyzerPlugin[] } = {}) {
   const base = process.env.HITLOOP_ARCHIVE_CONTROL_URL, token = process.env.HITLOOP_ARCHIVE_WORKER_TOKEN, wid = process.env.HITLOOP_ARCHIVE_WORKER_ID;
   if (!base || !token || !wid) { console.error('Set HITLOOP_ARCHIVE_CONTROL_URL, HITLOOP_ARCHIVE_WORKER_TOKEN, HITLOOP_ARCHIVE_WORKER_ID'); process.exit(1); }
   const workerId = `${wid}-analyzer`;
   const store = new ReadOnlyStore();
   const server = createAnalyzerServer({
-    workerId, thumbDir: path.join(HOME_DIR, 'thumbs'), store,
+    workerId, thumbDir: path.join(HOME_DIR, 'thumbs'), store, plugins,
     // Same dry run the queued "Estimate" command does, answered instantly on this Mac (no cloud round trip, no model calls).
     estimate: ({ sourceId, paths, promptVersion, model, batch }) => runAnalyze(
       { id: 'live-estimate', type: 'ANALYZE_FACETS', sourceId, paths, dryRun: true, ...(batch ? { batch: true } : {}), ...(promptVersion ? { promptVersion } : {}), ...(model ? { model } : {}) },
@@ -107,8 +134,10 @@ if (process.argv[1]?.endsWith('analyzer/daemon.ts')) {
     ),
   });
   server.listen(PORT, '127.0.0.1', () => console.log(`analyzer ${workerId} serving http://127.0.0.1:${PORT}`));
-  const daemon = new AnalyzerDaemon(new AnalyzerControl(base, token, workerId), store);
+  const daemon = new AnalyzerDaemon(new AnalyzerControl(base, token, workerId), store, { plugins, collectOnStart: true });
   const quit = () => { daemon.stop(); server.close(); };
   process.on('SIGINT', quit); process.on('SIGTERM', quit);
   void daemon.run();
 }
+
+if (process.argv[1]?.endsWith('analyzer/daemon.ts')) startAnalyzer({ plugins: [] });

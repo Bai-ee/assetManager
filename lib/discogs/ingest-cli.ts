@@ -16,71 +16,24 @@
  * ~/.discogs-ingest/runs; label reads are cached under ~/.discogs-ingest/cache
  * so re-running costs nothing. Nothing is ever written to the source folder.
  */
-import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { DiscogsClient } from './client.ts';
-import { scanFolder, toJpeg, groupRecords, DEFAULT_INDEX_PATH } from './media.ts';
-import { readLabel } from './label-reader.ts';
-import { mergeReads, findCandidates } from './matcher.ts';
-import { ADD_THRESHOLD, REVIEW_THRESHOLD } from './types.ts';
-import type { GroupPlan, LabelRead, RecordGroup } from './types.ts';
-import { CostLedger, appendCostLog } from './cost.ts';
-import { plannedNames, applyRenames, undoRenames } from './rename.ts';
-import { basename } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { DiscogsClient } from './client';
+import { DEFAULT_INDEX_PATH } from './media';
+import { mergeReads } from './matcher';
+import type { GroupPlan } from './types';
+import { plannedNames, applyRenames, undoRenames } from './rename';
+import { planFolder, applyPlan, undoApply, notesFor, NOTES_FIELD_ID } from './run';
 
 const HOME = join(homedir(), '.discogs-ingest');
 const CACHE = join(HOME, 'cache');
 const RUNS = join(HOME, 'runs');
-const NOTES_FIELD_ID = 3;
 const COST_LOG = join(HOME, 'costs.jsonl');
-const ledger = new CostLedger();
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
   return i > -1 ? process.argv[i + 1] : undefined;
-}
-
-function hasUsefulFields(reads: LabelRead[]): boolean {
-  return reads.some(r => r.status !== 'unreadable' && (r.catno || r.artist || r.title));
-}
-
-async function planGroup(client: DiscogsClient, group: RecordGroup, owned: Set<number>, claimed: Set<number>): Promise<GroupPlan> {
-  const reads: LabelRead[] = [];
-  for (const img of group.images) {
-    const jpeg = await toJpeg(img, CACHE);
-    const read = await readLabel(jpeg, img.name, { cacheDir: CACHE });
-    ledger.add({ kind: 'vision', file: img.name, model: read.model, usage: read.usage, cached: read.cached });
-    reads.push(read);
-  }
-  const base = { group, reads, candidates: [], best: null } as GroupPlan;
-  if (!group.images.length) return { ...base, action: 'skip-unreadable', reason: 'video only, no label photo' };
-  if (!hasUsefulFields(reads)) return { ...base, action: 'skip-unreadable', reason: 'no readable label text' };
-
-  const candidates = await findCandidates(client, mergeReads(reads));
-  const best = candidates[0] ?? null;
-  const plan = { ...base, candidates, best };
-  if (!best || best.score < REVIEW_THRESHOLD) return { ...plan, action: 'review', reason: 'no confident match' };
-  if (owned.has(best.releaseId)) return { ...plan, action: 'already-owned', reason: 'already in collection' };
-  if (claimed.has(best.releaseId)) return { ...plan, action: 'already-owned', reason: 'same release as an earlier group in this run' };
-  if (best.score >= ADD_THRESHOLD && best.reasons.includes('catno exact')) {
-    claimed.add(best.releaseId);
-    return { ...plan, action: 'add', reason: `score ${best.score}, catno exact` };
-  }
-  return { ...plan, action: 'review', reason: `score ${best.score}${best.reasons.includes('catno exact') ? '' : ', no exact catno'}` };
-}
-
-const NOTES_MAX = 250; // Discogs rejects longer collection notes (422)
-
-function notesFor(group: RecordGroup, renamed: Map<string, string> = new Map()): string {
-  const name = (f: { path: string; name: string }) => renamed.has(f.path) ? basename(renamed.get(f.path)!) : f.name;
-  const imgs = group.images.map(name);
-  const vids = group.videos.map(name);
-  const full = `HITLOOP ingest. Label photos: ${imgs.join(', ') || 'none'}. Videos: ${vids.join(', ') || 'none'}.`;
-  if (full.length <= NOTES_MAX) return full;
-  // Renamed files share one base; name it once and count the rest.
-  const base = (imgs[0] ?? vids[0] ?? '').replace(/_(label|video)\d+(-\d+)?\.\w+$/, '');
-  return `HITLOOP ingest. Files: ${base}_* (${imgs.length} label photo${imgs.length === 1 ? '' : 's'}, ${vids.length} video${vids.length === 1 ? '' : 's'}).`.slice(0, NOTES_MAX);
 }
 
 function printPlan(plans: GroupPlan[]) {
@@ -98,12 +51,14 @@ function printPlan(plans: GroupPlan[]) {
 }
 
 async function undo(file: string) {
-  const client = new DiscogsClient();
-  const me = await client.identity();
-  const rows = readFileSync(file, 'utf8').trim().split('\n').map(l => JSON.parse(l));
-  for (const r of rows) {
-    await client.removeInstance(me.username, r.folderId, r.releaseId, r.instanceId);
-    console.log(`removed ${r.releaseId} (instance ${r.instanceId})`);
+  const abs = resolve(file);
+  const r = await undoApply({ journal: basename(abs) }, {
+    client: new DiscogsClient(), runsDir: dirname(abs),
+    onRemoved: x => console.log(`removed ${x.releaseId} (instance ${x.instanceId})`),
+  });
+  if (r.errors.length) {
+    for (const e of r.errors) console.error(`could not remove ${e.releaseId}: ${e.error}`);
+    throw new Error(`${r.errors.length} instances not removed`);
   }
 }
 
@@ -130,27 +85,19 @@ async function main() {
   const client = new DiscogsClient();
   if (!client.configured) throw new Error('DISCOGS_TOKEN missing');
   const me = await client.identity();
-  const owned = await client.collectionReleaseIds(me.username);
 
-  const files = await scanFolder(dir, { indexPath: DEFAULT_INDEX_PATH });
-  const groups = groupRecords(files).slice(0, limit);
-  console.log(`${files.length} files, ${files.filter(f => f.duplicateOf).length} duplicates, ${groups.length} groups. Collection: ${owned.size} releases.`);
-
-  const plans: GroupPlan[] = [];
-  const claimed = new Set<number>();
-  for (const g of groups) {
-    try { plans.push(await planGroup(client, g, owned, claimed)); }
-    catch (e) { plans.push({ group: g, reads: [], candidates: [], best: null, action: 'review', reason: `error: ${e instanceof Error ? e.message : e}` }); }
-  }
+  const deps = { client, cacheDir: CACHE, runsDir: RUNS, indexPath: DEFAULT_INDEX_PATH, costLogPath: COST_LOG };
+  const run = await planFolder({ dir, limit }, {
+    ...deps,
+    onScanned: i => console.log(`${i.files} files, ${i.duplicates} duplicates, ${i.groups} groups. Collection: ${i.collection} releases.`),
+  });
+  const plans = run.plans;
+  const stamp = run.planId;
   printPlan(plans);
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const cost = ledger.summary();
-  appendCostLog(COST_LOG, { runId: stamp, folder: dir, ...cost });
+  const cost = run.cost;
   console.log(`\nCost: $${cost.usd.toFixed(4)} | ${cost.billedCalls} billed vision calls, ${cost.cachedCalls} cached (free) | ${cost.inputTokens} in / ${cost.outputTokens} out tokens${cost.unknownModelCalls ? ` | ${cost.unknownModelCalls} calls on an unpriced model` : ''}`);
-  const planFile = join(RUNS, `${stamp}-plan.json`);
-  writeFileSync(planFile, JSON.stringify(plans, null, 2));
-  console.log(`\nPlan saved: ${planFile}`);
+  console.log(`\nPlan saved: ${join(RUNS, `${stamp}-plan.json`)}`);
   // Confident = exact catalog number on a release we add or already own.
   const confident = plans.filter(p => p.best && p.best.reasons.includes('catno exact') && (p.action === 'add' || p.action === 'already-owned'));
   const renamePairs = withRename ? confident.flatMap(p => plannedNames(p.group, p.best!)) : [];
@@ -162,13 +109,14 @@ async function main() {
   }
 
   const log = join(RUNS, `${stamp}-applied.jsonl`);
-  for (const p of plans.filter(p => p.action === 'add' && p.best)) {
-    const releaseId = p.best!.releaseId;
-    const added = await client.addToCollection(me.username, folderId, releaseId);
-    appendFileSync(log, JSON.stringify({ releaseId, folderId, instanceId: added.instance_id, group: p.group.id }) + '\n');
-    if (withNotes) await client.setInstanceField(me.username, folderId, releaseId, added.instance_id, NOTES_FIELD_ID, notesFor(p.group));
-    console.log(`added ${releaseId} ${p.best!.title} (instance ${added.instance_id})`);
-  }
+  const toAdd = plans.filter(p => p.action === 'add' && p.best);
+  const titles = new Map(toAdd.map(p => [p.group.id, p.best!.title]));
+  const applied = await applyPlan(
+    { planId: stamp, items: toAdd.map(p => ({ groupId: p.group.id, releaseId: p.best!.releaseId })), notes: withNotes, folderId },
+    { ...deps, plans, journalName: `${stamp}-applied.jsonl`, onAdded: a => console.log(`added ${a.releaseId} ${titles.get(a.groupId)} (instance ${a.instanceId})`) },
+  );
+  for (const e of applied.errors) console.error(`add failed for ${e.releaseId}: ${e.error}`);
+  if (applied.errors.length) throw new Error(`${applied.errors.length} adds failed; undo what was added with: npm run discogs:ingest -- --undo ${log}`);
   console.log(`Applied. Undo with: npm run discogs:ingest -- --undo ${log}`);
 
   const renamed = new Map<string, string>();

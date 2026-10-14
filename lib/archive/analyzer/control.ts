@@ -1,7 +1,11 @@
 export interface Cmd {
   id: string; type: string; workerId?: string; sourceId?: string;
   paths?: string[]; capUsd?: number; model?: string; promptVersion?: string; dryRun?: boolean; batch?: boolean;
+  /** ANALYZE_FACETS: ignore the done index (full per-file walk + checks) and refresh it. */
+  verify?: boolean;
   packageId?: string; sha256?: string; relativePath?: string; targetCommandId?: string; jobId?: string;
+  /** Plugin command fields ride along. */
+  [extra: string]: unknown;
 }
 export interface CmdUpdate { commandId: string; state: 'CLAIMED' | 'RUNNING' | 'COMPLETE' | 'FAILED'; error?: string | null; result?: unknown }
 export interface ResultItem {
@@ -12,7 +16,7 @@ export interface ResultItem {
   organizedPath?: string;
 }
 
-export const CAPABILITIES = ['ANALYZE_FACETS', 'STAGE_FOR_PUBLISH', 'CANCEL_JOB'];
+export const CAPABILITIES = ['ANALYZE_FACETS', 'STAGE_FOR_PUBLISH', 'CANCEL_JOB', 'COLLECT_BATCHES'];
 export const LOCAL_THUMB_BASE = 'http://127.0.0.1:8777';
 
 /** HITLOOP control-plane client for the analyzer. fetch is injectable for tests. */
@@ -22,7 +26,15 @@ export class AnalyzerControl {
     private token: string,
     readonly workerId: string,
     private fetchImpl: typeof fetch = fetch,
-  ) {}
+    extraCommandTypes: string[] = [],
+  ) {
+    this.extraCommandTypes = [...extraCommandTypes];
+  }
+
+  private extraCommandTypes: string[];
+  /** Plugin command types, added to poll `types` and heartbeat `capabilities`. */
+  setExtraCommandTypes(types: string[]) { this.extraCommandTypes = [...types]; }
+  private allTypes(): string[] { return Array.from(new Set([...CAPABILITIES, ...this.extraCommandTypes])); }
 
   private url(p: string) { return new URL(p, this.baseUrl); }
   private h(json = true): Record<string, string> { return { authorization: `Bearer ${this.token}`, ...(json ? { 'content-type': 'application/json' } : {}) }; }
@@ -37,14 +49,14 @@ export class AnalyzerControl {
   async heartbeat(sourceId: string, state: 'ONLINE' | 'PROCESSING', jobId?: string): Promise<void> {
     await this.send('POST', '/api/archive/worker/heartbeat', {
       workerId: this.workerId, sourceId, state, at: new Date().toISOString(), ...(jobId ? { jobId } : {}),
-      capabilities: CAPABILITIES, localThumbBase: LOCAL_THUMB_BASE,
+      capabilities: this.allTypes(), localThumbBase: LOCAL_THUMB_BASE,
     });
   }
 
   async poll(): Promise<Cmd[]> {
     const u = new URL('/api/archive/commands/worker', this.baseUrl);
     u.searchParams.set('workerId', this.workerId);
-    u.searchParams.set('types', 'ANALYZE_FACETS,STAGE_FOR_PUBLISH,CANCEL_JOB');
+    u.searchParams.set('types', this.allTypes().join(','));
     const res = await this.fetchImpl(u, { headers: this.h(false), signal: AbortSignal.timeout(10_000) });
     if (!res.ok) throw new Error(`HITLOOP command poll failed: ${res.status}`);
     return ((await res.json()) as { commands?: Cmd[] }).commands || [];

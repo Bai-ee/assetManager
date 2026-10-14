@@ -7,8 +7,13 @@
 ## Prerequisites
 - macOS, Node >= 22, `ffmpeg`/`ffprobe` (loudnorm, ebur128, astats, scale_vt, h264_videotoolbox, libx264), `sips`.
 - NAS mounted at `/Volumes/bryan` (read-only except the rename exception below).
-- HITLOOP side: worktree `~/Documents/Repos/Bballi_Portfolio-discogs`, branch `feat/discogs-x-drafts`, `npm run dev` on :3000.
+- HITLOOP side: Discogs code lives in worktree `~/Documents/Repos/Bballi_Portfolio-content-system` (formerly `Bballi_Portfolio-discogs`), `npm run dev` on :3000.
 - `.env.local` in this repo with (names only): `DISCOGS_TOKEN` (discogs.com/settings/developers), `ANTHROPIC_API_KEY`, `HITLOOP_ARCHIVE_CONTROL_URL` (e.g. `http://localhost:3000`), `HITLOOP_ARCHIVE_WORKER_TOKEN`.
+
+## Dashboard panel
+Content Engine card > Record/Discogs source panel: pick a NAS folder, see the price, **Read labels & match**, review held records, **Add to collection**, **Undo**. Contract: `docs/plans/DISCOGS-PANEL-CONTRACT.md` in the HITLOOP worktree. Plan/apply/undo are queued commands (`DISCOGS_PLAN`, `DISCOGS_APPLY`, `DISCOGS_UNDO`); free live routes are `GET /discogs/status` and `POST /discogs/estimate` on the analyzer (`127.0.0.1:8777`).
+
+The analyzer now serves Discogs: `npm run archive:analyzer` starts `lib/discogs/analyzer-entry.ts` (analyzer + Discogs plugin). It needs `DISCOGS_TOKEN` and `ANTHROPIC_API_KEY` in `.env.local`; restart it after pulling Discogs changes. The CLI below uses the same runtime (`lib/discogs/run.ts`).
 
 ## Commands
 ```
@@ -45,7 +50,7 @@ Firebase (via HITLOOP): `publish-staging/discogs/<id>/`.
 - No emoji in post/reply text. Posts are never auto-published. Links go in the first self-reply.
 
 ## Known gaps
-- Self-reply posting to X is not built.
+- Panel v1 covers Plan + Add to collection + Undo only; NAS renames and render/draft stay CLI-only.
 - HITLOOP Studio tab is not built.
 - Matcher may propose idea rows.
 - VideoToolbox encoding is macOS only.
