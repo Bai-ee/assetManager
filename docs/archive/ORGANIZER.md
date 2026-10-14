@@ -131,7 +131,7 @@ Rules:
 - Undo: tries the client location first, then always the legacy top-level
   location, so collections organized before this change still undo.
 
-To add a client, add one line to `clients.map.json` (public ids only).
+To add a client, add one line to `clients.map.json` (public ids only) and restart the worker (`npm run archive:worker`); the map is read once at startup.
 
 ## Commands
 

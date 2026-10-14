@@ -79,6 +79,14 @@ CONTENT_AI_PROVIDER=minimax
 CONTENT_AI_API_KEY=your-api-key
 ```
 
+## HITLOOP Archive worker (per-client NAS)
+
+Start the worker with `npm run archive:worker` (reads `.env.local`). Details: `docs/archive/ORGANIZER.md`.
+
+- Organized layout: `<source>/HITLOOP-ARCHIVE/<client-slug>/<collection>/<pillar>/`. Legacy top-level collections (`HITLOOP-ARCHIVE/<collection>/<pillar>/`) belong to the home client.
+- `lib/archive/clients.map.json` maps `<client-slug>` to a Hitloop `clientId` (public ids only, no secrets). Home is never listed. When a client is onboarded, add its line and restart the worker (the map is loaded and validated at startup).
+- Items under a client folder are sent to Hitloop with that `clientId`; home/legacy items send none and Hitloop falls back to the home client.
+
 ## Architecture
 
 - **Next.js 14** with App Router
