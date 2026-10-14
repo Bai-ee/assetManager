@@ -1,0 +1,32 @@
+# Secrets — this file was previously EMPTY, so every .env below was trackable.
+# The Archive Worker holds TwelveLabs / Jev / control-plane credentials and
+# (later) Arweave wallet material. None of it belongs in git.
+.env
+.env.*
+!.env.archive.example
+
+# Dependencies / build
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Worker durable state — SQLite/WAL lives on the worker host, not in the repo
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+data/
+
+# OS / editor
+.DS_Store
+*.log
+.vscode/
+.idea/
+
+# local state / build artifacts
+.moleboard/
+tsconfig.tsbuildinfo
+*-E
