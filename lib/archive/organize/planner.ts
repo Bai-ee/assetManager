@@ -4,6 +4,7 @@ import { ArchiveDatabase } from '../database';
 import type { ArchiveSource, SelectionItem } from '../types';
 import { reviewBand } from '../jev/service';
 import { JEV_QUESTIONS } from '../jev/taxonomy';
+import { CLIENTS_MAP, clientSlugForPath } from '../clients';
 import {
   ORGANIZED_ROOT_NAME,
   UNSORTED,
@@ -18,6 +19,14 @@ import {
   targetPath,
   withCollisionSuffix,
 } from './scheme';
+
+/** A legacy (home) collection may not be named like a client slug: it would land at
+ * HITLOOP-ARCHIVE/<slug>/ and be indistinguishable from that client's folder. */
+function assertNotSlugNamedLegacyCollection(collectionId: string, clientSlug: string | null) {
+  if (!clientSlug && Object.prototype.hasOwnProperty.call(CLIENTS_MAP, collectionId)) {
+    throw new Error(`collectionId "${collectionId}" is reserved for a client folder (clients.map.json); pick another collection name`);
+  }
+}
 
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.moleboard']);
 
@@ -54,6 +63,10 @@ export interface OrganizePlan {
    * (`PROCESS_SELECTION`/`ORGANIZE_COLLECTION{items}`). Mutually exclusive
    * with `selectedRelativePath`. */
   selection?: SelectionItem[];
+  /** `clients.map.json` slug when the selection sits under `<slug>/...`
+   * (items: only when every item agrees). Collection lands at
+   * `HITLOOP-ARCHIVE/<clientSlug>/<collectionId>/`. Absent = legacy/home. */
+  clientSlug?: string;
   moves: OrganizePlanMove[];
   skipped: OrganizePlanSkip[];
   counts: { moves: number; skipped: number };
@@ -219,10 +232,11 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
   async function planEntry(opts: {
     relFromSource: string;
     collectionId: string;
+    clientSlug: string | null;
     insideSelection: (relativePath: string) => boolean;
     projectAncestorReason: () => Promise<string | null>;
   }): Promise<void> {
-    const { relFromSource, collectionId } = opts;
+    const { relFromSource, collectionId, clientSlug } = opts;
     const basename = path.basename(relFromSource);
 
     if (isFilesystemArtifact(basename)) { skipped.push({ path: relFromSource, reason: 'filesystem artifact' }); return; }
@@ -270,8 +284,8 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
     }
 
     let filename = basename;
-    let toAbsolute = targetPath(sourceRoot, collectionId, pillar, filename);
-    let claimKey = `${collectionId}/${pillar}/${filename}`;
+    let toAbsolute = targetPath(sourceRoot, collectionId, pillar, filename, clientSlug);
+    let claimKey = `${clientSlug ?? ''}/${collectionId}/${pillar}/${filename}`;
     const claimedSha = claimed.get(claimKey);
     let collides = Boolean(claimedSha && claimedSha !== asset.sha256);
     if (!collides && !claimedSha) {
@@ -281,8 +295,8 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
     }
     if (collides) {
       filename = withCollisionSuffix(basename, asset.sha256);
-      toAbsolute = targetPath(sourceRoot, collectionId, pillar, filename);
-      claimKey = `${collectionId}/${pillar}/${filename}`;
+      toAbsolute = targetPath(sourceRoot, collectionId, pillar, filename, clientSlug);
+      claimKey = `${clientSlug ?? ''}/${collectionId}/${pillar}/${filename}`;
     }
     claimed.set(claimKey, asset.sha256);
     plannedAssets.add(asset.id);
@@ -299,6 +313,12 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
 
   if ('items' in params) {
     const { items, collectionId } = params;
+    // A selection is client-scoped only when every item sits under the same slug; mixing
+    // clients (or a client with home items) is rejected rather than routed to legacy.
+    const itemSlugs = new Set(items.map(item => clientSlugForPath(item.relativePath)));
+    if (itemSlugs.size > 1) throw new Error('Selection mixes client folders (or a client folder with home items); organize each client separately');
+    const clientSlug = Array.from(itemSlugs)[0] ?? null;
+    assertNotSlugNamedLegacyCollection(collectionId, clientSlug);
     const insideSelection = (relativePath: string) => isInsideItemsSelection(relativePath, items);
     // Absolute-path dedupe: a file inside a selected folder that is ALSO
     // separately selected (or covered by two overlapping selected folders)
@@ -321,6 +341,7 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
           await planEntry({
             relFromSource,
             collectionId,
+            clientSlug,
             insideSelection,
             projectAncestorReason: async () => projectAncestorOf(entry.relativePath, projectDirs),
           });
@@ -334,6 +355,7 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
         await planEntry({
           relFromSource,
           collectionId,
+          clientSlug,
           insideSelection,
           projectAncestorReason: () => ancestorProjectFolder(sourceRoot, absolute),
         });
@@ -344,6 +366,7 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
       root,
       collectionId,
       selection: items,
+      ...(clientSlug ? { clientSlug } : {}),
       moves,
       skipped,
       counts: { moves: moves.length, skipped: skipped.length },
@@ -358,6 +381,8 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
   }
 
   const collectionId = slugifyCollectionId(selectedRelativePath);
+  const clientSlug = clientSlugForPath(selectedRelativePath);
+  assertNotSlugNamedLegacyCollection(collectionId, clientSlug);
   const projectDirs = await findProjectDirs(selectedRoot);
 
   for await (const entry of walkAll(selectedRoot)) {
@@ -365,6 +390,7 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
     await planEntry({
       relFromSource,
       collectionId,
+      clientSlug,
       insideSelection: (relativePath: string) => isInsideSelection(relativePath, selectedRelativePath),
       projectAncestorReason: async () => projectAncestorOf(entry.relativePath, projectDirs),
     });
@@ -374,6 +400,7 @@ export async function planOrganizeCollection(params: PlanOrganizeParams): Promis
     root,
     collectionId,
     selectedRelativePath,
+    ...(clientSlug ? { clientSlug } : {}),
     moves,
     skipped,
     counts: { moves: moves.length, skipped: skipped.length },

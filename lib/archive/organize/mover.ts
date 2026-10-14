@@ -2,7 +2,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { ArchiveDatabase } from '../database';
 import type { ArchiveSource } from '../types';
-import { ORGANIZED_ROOT_NAME, collectionIdFromOrganizedRelativePath, collectionTitleFromPath, isUnderOrganizedRoot } from './scheme';
+import { ORGANIZED_ROOT_NAME, organizedCollectionFromRelativePath, collectionTitleFromPath, isUnderOrganizedRoot } from './scheme';
 import { appendMoveJournalLine, listOrganizeMovesForJob, recordOrganizeMove } from './journal';
 import { writeAssetRecordSidecar, writeCollectionSidecar } from './sidecars';
 import type { OrganizePlan, OrganizePlanMove } from './planner';
@@ -46,6 +46,7 @@ export async function applyOrganizePlan(params: {
       await writeCollectionSidecar({
         sourceRootPath: sourceRoot,
         collectionId: plan.collectionId,
+        clientSlug: plan.clientSlug,
         // An items-selection plan has no single path to title itself with;
         // the collectionId (the caller-supplied/HITLOOP-picker id) stands in.
         title: plan.selection ? plan.collectionId : collectionTitleFromPath(plan.selectedRelativePath || '.'),
@@ -55,7 +56,7 @@ export async function applyOrganizePlan(params: {
         moved,
       });
       for (const move of moved) {
-        await writeAssetRecordSidecar({ db, sourceRootPath: sourceRoot, collectionId: plan.collectionId, move });
+        await writeAssetRecordSidecar({ db, sourceRootPath: sourceRoot, collectionId: plan.collectionId, clientSlug: plan.clientSlug, move });
       }
     } catch { /* sidecars are a convenience copy; SQLite remains authoritative */ }
     return { jobId, moved, failedAt };
@@ -80,7 +81,7 @@ export async function applyOrganizePlan(params: {
       const ts = new Date().toISOString();
       // Journaled BEFORE the rename, on disk and in SQLite, so a crash
       // between the two still leaves durable evidence of intent.
-      await appendMoveJournalLine(sourceRoot, plan.collectionId, { ts, jobId, sha256: move.sha256, from: move.from, to: move.to, sizeBytes: move.sizeBytes, reason: 'organize' });
+      await appendMoveJournalLine(sourceRoot, plan.collectionId, { ts, jobId, sha256: move.sha256, from: move.from, to: move.to, sizeBytes: move.sizeBytes, reason: 'organize' }, plan.clientSlug);
       recordOrganizeMove(db, { jobId, sha256: move.sha256, from: move.from, to: move.to, sizeBytes: move.sizeBytes, reason: 'organize' });
 
       await fs.rename(fromAbs, toAbs);
@@ -127,13 +128,13 @@ export async function undoOrganizeJob(params: {
   for (const move of [...moves].reverse()) {
     const currentAbs = path.resolve(sourceRoot, move.toPath);
     const restoreAbs = path.resolve(sourceRoot, move.fromPath);
-    const collectionId = collectionIdFromOrganizedRelativePath(move.toPath);
+    const collection = organizedCollectionFromRelativePath(move.toPath);
 
     try {
       await fs.mkdir(path.dirname(restoreAbs), { recursive: true });
       const ts = new Date().toISOString();
-      if (collectionId) {
-        await appendMoveJournalLine(sourceRoot, collectionId, { ts, jobId, sha256: move.sha256, from: move.toPath, to: move.fromPath, sizeBytes: move.sizeBytes, reason: 'undo' });
+      if (collection) {
+        await appendMoveJournalLine(sourceRoot, collection.collectionId, { ts, jobId, sha256: move.sha256, from: move.toPath, to: move.fromPath, sizeBytes: move.sizeBytes, reason: 'undo' }, collection.clientSlug);
       }
       recordOrganizeMove(db, { jobId, sha256: move.sha256, from: move.toPath, to: move.fromPath, sizeBytes: move.sizeBytes, reason: 'undo' });
 

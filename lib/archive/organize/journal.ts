@@ -17,8 +17,8 @@ export interface MoveJournalEntry {
   reason: MoveReason;
 }
 
-export function journalPath(sourceRootPath: string, collectionId: string): string {
-  return path.join(collectionMetaDir(sourceRootPath, collectionId), 'moves.jsonl');
+export function journalPath(sourceRootPath: string, collectionId: string, clientSlug?: string | null): string {
+  return path.join(collectionMetaDir(sourceRootPath, collectionId, clientSlug), 'moves.jsonl');
 }
 
 /**
@@ -26,10 +26,10 @@ export function journalPath(sourceRootPath: string, collectionId: string): strin
  * called BEFORE the corresponding `fs.rename` (mover.ts) so a crash between
  * the two still leaves a durable record of intent.
  */
-export async function appendMoveJournalLine(sourceRootPath: string, collectionId: string, entry: MoveJournalEntry): Promise<void> {
-  const dir = collectionMetaDir(sourceRootPath, collectionId);
+export async function appendMoveJournalLine(sourceRootPath: string, collectionId: string, entry: MoveJournalEntry, clientSlug?: string | null): Promise<void> {
+  const dir = collectionMetaDir(sourceRootPath, collectionId, clientSlug);
   await fs.mkdir(dir, { recursive: true });
-  await fs.appendFile(journalPath(sourceRootPath, collectionId), `${JSON.stringify(entry)}\n`, 'utf8');
+  await fs.appendFile(journalPath(sourceRootPath, collectionId, clientSlug), `${JSON.stringify(entry)}\n`, 'utf8');
 }
 
 /** Reads back the on-disk journal for a collection. Returns `[]` when no
@@ -37,9 +37,9 @@ export async function appendMoveJournalLine(sourceRootPath: string, collectionId
  * human-inspectable / NAS-portable copy; `listOrganizeMovesForJob` (SQLite)
  * is the one undo actually replays from, per the "works even if the `_meta`
  * file is lost" requirement. */
-export async function readMoveJournal(sourceRootPath: string, collectionId: string): Promise<MoveJournalEntry[]> {
+export async function readMoveJournal(sourceRootPath: string, collectionId: string, clientSlug?: string | null): Promise<MoveJournalEntry[]> {
   try {
-    const text = await fs.readFile(journalPath(sourceRootPath, collectionId), 'utf8');
+    const text = await fs.readFile(journalPath(sourceRootPath, collectionId, clientSlug), 'utf8');
     return text.split('\n').filter(Boolean).map(line => JSON.parse(line) as MoveJournalEntry);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];

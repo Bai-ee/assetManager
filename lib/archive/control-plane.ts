@@ -169,6 +169,8 @@ export class ControlPlaneClient {
       // workstream — a non-2xx here must not fail the organize command
       // (silent no-op, same as every other syncAsset call).
       organized?: { path: string; appliedAt: string };
+      // HITLOOP clientId when a path sits under a clients.map.json slug; omitted = home.
+      clientId?: string;
     };
   }): Promise<void> {
     if (!this.configured) return;

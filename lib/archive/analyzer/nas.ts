@@ -5,12 +5,33 @@ import * as path from 'path';
 import { sha256File } from '../hash';
 import { inferMediaType } from '../media-type';
 import { resolveUnder, type SourceInfo } from './store';
+import { CLIENTS_MAP, clientSlugForPath, type ClientsMap } from '../clients';
 
 export const FALLBACK_SMB_URL = 'smb://GUEST@192.168.1.6/bryan';
 export const FALLBACK_MOUNT_POINT = '/Volumes/bryan';
 export const CLOUD_INTAKE_SOURCE_ID = 'd3971a850e975bfd21fe2a89';
 export const CONTENT_DIR = 'HITLOOP-ARCHIVE/content';
 export const META_DIR = `${CONTENT_DIR}/_meta`;
+
+/** Analyzer copy root for a source-root-relative path: `HITLOOP-ARCHIVE/<slug>/content` when the
+ * path maps to a `clients.map.json` slug, else the legacy `HITLOOP-ARCHIVE/content`. The `_meta`
+ * sidecars stay in the shared META_DIR (keyed by sha) either way, so `organizedFor` is unchanged. */
+export function contentDirFor(relativePath: string, map: ClientsMap = CLIENTS_MAP): string {
+  const slug = clientSlugForPath(relativePath, map);
+  return slug ? `HITLOOP-ARCHIVE/${slug}/content` : CONTENT_DIR;
+}
+
+/** True for the analyzer's own copy roots (legacy or per-client), which walks must skip. */
+export function isAnalyzerContentDir(relativePath: string, map: ClientsMap = CLIENTS_MAP): boolean {
+  if (relativePath === CONTENT_DIR) return true;
+  const p = relativePath.split('/');
+  return p.length === 3 && p[0] === 'HITLOOP-ARCHIVE' && p[2] === 'content' && Object.prototype.hasOwnProperty.call(map, p[1]);
+}
+
+const isUnderAnalyzerContentDir = (relativePath: string) => {
+  const p = relativePath.split('/');
+  return isAnalyzerContentDir(p.slice(0, 2).join('/')) || isAnalyzerContentDir(p.slice(0, 3).join('/'));
+};
 export const BROWSE_LIMIT = 2000;
 export const CHILD_COUNT_CAP = 1000;
 
@@ -148,10 +169,11 @@ export function organizedFor(rootPath: string, sha256: string): string | null {
   } catch { return null; }
 }
 
-/** Copies (never moves) the original to HITLOOP-ARCHIVE/content/<kind>/<year|unknown>/<name>. Returns the source-root-relative path. */
+/** Copies (never moves) the original to HITLOOP-ARCHIVE/content/<kind>/<year|unknown>/<name>
+ * (or HITLOOP-ARCHIVE/<client-slug>/content/... for a client path). Returns the source-root-relative path. */
 export async function organizeCopy(i: OrganizeInput): Promise<string> {
-  const contentRoot = path.join(i.rootPath, CONTENT_DIR);
-  if (i.originalRelativePath === CONTENT_DIR || i.originalRelativePath.startsWith(`${CONTENT_DIR}/`)) return i.originalRelativePath;
+  const contentRoot = path.join(i.rootPath, contentDirFor(i.originalRelativePath));
+  if (isUnderAnalyzerContentDir(i.originalRelativePath)) return i.originalRelativePath;
   const hashFile = i.hashFile ?? sha256File;
   const srcSize = fs.statSync(i.originalAbs).size;
 

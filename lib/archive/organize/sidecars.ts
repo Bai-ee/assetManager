@@ -33,13 +33,14 @@ export interface CollectionSidecar {
 export async function writeCollectionSidecar(params: {
   sourceRootPath: string;
   collectionId: string;
+  clientSlug?: string | null;
   title: string;
   sourceRelativePath?: string;
   selection?: SelectionItem[];
   plan: OrganizePlan;
   moved: OrganizePlanMove[];
 }): Promise<string> {
-  const dir = collectionMetaDir(params.sourceRootPath, params.collectionId);
+  const dir = collectionMetaDir(params.sourceRootPath, params.collectionId, params.clientSlug);
   await fs.mkdir(dir, { recursive: true });
   const filePath = path.join(dir, 'collection.json');
   const sidecar: CollectionSidecar = {
@@ -73,10 +74,11 @@ export async function writeAssetRecordSidecar(params: {
   db: ArchiveDatabase;
   sourceRootPath: string;
   collectionId: string;
+  clientSlug?: string | null;
   move: OrganizePlanMove;
 }): Promise<string> {
-  const { db, sourceRootPath, collectionId, move } = params;
-  const dir = collectionMetaDir(sourceRootPath, collectionId);
+  const { db, sourceRootPath, collectionId, clientSlug, move } = params;
+  const dir = collectionMetaDir(sourceRootPath, collectionId, clientSlug);
   await fs.mkdir(dir, { recursive: true });
   const sha12 = move.sha256.slice(0, 12);
   const filePath = path.join(dir, `${sha12}.record.json`);

@@ -18,6 +18,7 @@ import type { ArchiveSource, CollectionJobRecord, ContentAssetRecord, SelectionI
 import { planOrganizeCollection, type OrganizePlan } from './organize/planner';
 import { applyOrganizePlan, undoOrganizeJob } from './organize/mover';
 import { slugifyCollectionId, isMovableExtension, ORGANIZED_ROOT_NAME } from './organize/scheme';
+import { CLIENTS_MAP, clientForAllPaths, clientSlugForPath } from './clients';
 import {
   ensureCloudIntakeSource,
   drainIntake,
@@ -189,7 +190,10 @@ export class ArchiveDaemon {
     const observations=this.db.listObservations(asset.id);
     const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:reviewBand(d.confidence??0)}));
     const mediaType=locations[0]?inferMediaType(locations[0].relativePath):undefined;
-    try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state,...(organized?{organized}:{})}});}catch{/* durable local data remains authoritative; retry on later sync */}
+    // Per-client NAS (clients.map.json): sent only when EVERY location of this (deduped) asset maps
+    // to the same client; mixed or home locations send none and HITLOOP falls back to home.
+    const clientId=clientForAllPaths(locations.map(x=>x.relativePath));
+    try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state,...(organized?{organized}:{}),...(clientId?{clientId}:{})}});}catch{/* durable local data remains authoritative; retry on later sync */}
   }
 
   private async syncJobAssets(sourceId:string,jobId:string) {
@@ -555,7 +559,14 @@ export class ArchiveDaemon {
       // the caller already knows the id of) wins; otherwise fall back to the
       // pre-existing relativePath -> slug derivation.
       const collectionId = command.collectionId || slugifyCollectionId(command.relativePath || '.');
-      const jobId = command.organizeJobId || this.db.findLatestOrganizeJobIdForCollection(collectionId);
+      // Client-scoped collections live under HITLOOP-ARCHIVE/<slug>/<collectionId>/. Try the
+      // relativePath's slug (or, without one, every known slug), then ALWAYS the legacy top-level
+      // location last, so collections organized before per-client NAS still undo.
+      const undoSlug = clientSlugForPath(command.relativePath || '.');
+      const slugsToTry = undoSlug ? [undoSlug] : Object.keys(CLIENTS_MAP);
+      const jobId = command.organizeJobId
+        || slugsToTry.map(slug => this.db.findLatestOrganizeJobIdForCollection(collectionId, slug)).find(Boolean)
+        || this.db.findLatestOrganizeJobIdForCollection(collectionId);
       if (!jobId) throw new Error('No organize job found to undo for this collection');
 
       await this.control.updateCommand({ commandId:command.id, state:'RUNNING' });

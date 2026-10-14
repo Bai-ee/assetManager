@@ -7,7 +7,8 @@ import { BATCH_DISCOUNT, appendLedger, cacheKey, callCostUsd, estimateCallUsd, e
 import { withEventDates } from './event-date';
 import { DEFAULT_MODEL, PROMPT_VERSION, sanitizeAnalysis } from './schema';
 import { resolveUnder, type ReadOnlyStore } from './store';
-import { CONTENT_DIR, organizeCopy } from './nas';
+import { isAnalyzerContentDir, organizeCopy } from './nas';
+import { withClientId } from '../clients';
 import type { PrepareMedia } from './media';
 import type { Vision } from './vision';
 import { runAnalyzeBatch } from './batch';
@@ -42,7 +43,7 @@ export function walkMedia(root: string, paths: string[], opts: { index?: WalkInd
   const visit = (abs: string): ListingEntry | null => {
     const base = path.basename(abs);
     if (base.startsWith('.')) return null;
-    if (relOf(abs) === CONTENT_DIR) return null; // our own organized copies
+    if (isAnalyzerContentDir(relOf(abs))) return null; // our own organized copies (legacy + per-client)
     let st: fs.Stats;
     try { st = fs.lstatSync(abs); } catch { return null; }
     if (st.isSymbolicLink()) return null;
@@ -241,7 +242,7 @@ export async function runAnalyze(cmd: Cmd, deps: AnalyzeDeps): Promise<Record<st
         try { organizedPath = await organizeCopy({ rootPath: source.rootPath, sourceId: source.id, sha256: sha, originalAbs: f.abs, originalRelativePath: f.relativePath, entry: entry as any, thumbDir, hashFile }); }
         catch { organizeErrors++; }
       }
-      batch.push({ ...entry, relativePath: f.relativePath, costUsd, ...(organizedPath ? { organizedPath } : {}) });
+      batch.push(withClientId({ ...entry, relativePath: f.relativePath, costUsd, ...(organizedPath ? { organizedPath } : {}) }));
       if (batch.length >= PUSH_BATCH) await flush();
     } catch (e) {
       errors.push({ relativePath: f.relativePath, error: e instanceof Error ? e.message : String(e) });

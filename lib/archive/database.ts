@@ -219,9 +219,13 @@ export class ArchiveDatabase {
    * ORGANIZED_ROOT_NAME — duplicated as a literal here (not imported) so
    * database.ts never depends on worker.ts/organize/* (worker.ts already
    * depends on database.ts; importing back would cycle). */
-  findLatestOrganizeJobIdForCollection(collectionId:string):string|undefined {
-    const like = `HITLOOP-ARCHIVE/${collectionId}/%`;
-    const row = this.db.prepare(`SELECT job_id FROM organize_moves WHERE to_path LIKE ? AND reason='organize' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(like) as {job_id:string}|undefined;
+  findLatestOrganizeJobIdForCollection(collectionId:string,clientSlug?:string|null):string|undefined {
+    // Organized files sit exactly one bucket below their collection: legacy
+    // HITLOOP-ARCHIVE/<id>/<bucket>/<file>, client HITLOOP-ARCHIVE/<slug>/<id>/<bucket>/<file>.
+    // The NOT LIKE pins that depth, so a legacy lookup for an id equal to a slug
+    // never matches that client's deeper paths.
+    const prefix = clientSlug ? `HITLOOP-ARCHIVE/${clientSlug}/${collectionId}/` : `HITLOOP-ARCHIVE/${collectionId}/`;
+    const row = this.db.prepare(`SELECT job_id FROM organize_moves WHERE to_path LIKE ? AND to_path NOT LIKE ? AND reason='organize' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(`${prefix}%`, `${prefix}%/%/%`) as {job_id:string}|undefined;
     return row?.job_id;
   }
 

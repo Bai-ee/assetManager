@@ -3,6 +3,7 @@ import * as path from 'path';
 import { BATCH_DISCOUNT, appendLedger, cacheKey, callCostUsd, round6 } from './cost';
 import { sanitizeAnalysis, TOOL_NAME } from './schema';
 import { organizeCopy } from './nas';
+import { withClientId } from '../clients';
 import { buildRequestParams } from './vision';
 import type { PrepareMedia } from './media';
 import type { DoneIndex } from './done-index';
@@ -148,7 +149,7 @@ export async function runAnalyzeBatch(cmd: Cmd, deps: AnalyzeDeps, ctx: BatchCtx
       sizeBytes: file.sizeBytes, mtimeMs: file.mtimeMs, sha256: item.sha256, promptVersion, model,
       ...(item.organizedPath ? { organizedRelativePath: item.organizedPath } : {}),
     });
-    out.push(item); outFiles.push(file);
+    out.push(withClientId(item)); outFiles.push(file);
     if (out.length >= ctx.pushBatch) await flush();
   };
   const organize = async (sha: string, file: WalkedFile, entry: any, ) => {

@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { CLIENTS_MAP, clientSlugForPath, type ClientsMap } from '../clients';
 
 /**
  * NAS organizer (W-B, docs/plans/ARCHIVE-NAS-STAGING-MASTER-PLAN-2026-09-20.md
@@ -55,13 +56,8 @@ export function isProjectFolderName(name: string): boolean {
 
 // ---- PILLAR TAXONOMY ---------------------------------------------------
 
-export const PILLARS = ['was-there', 'made-this', 'found-this', 'how-made', 'thirty-years', 'building-now'] as const;
-export type Pillar = typeof PILLARS[number];
-export const UNSORTED = '_unsorted';
-
-export function isValidPillar(value: string | null | undefined): value is Pillar {
-  return !!value && (PILLARS as readonly string[]).includes(value);
-}
+export { PILLARS, UNSORTED, isValidPillar, isCollectionBucketName } from './pillars';
+export type { Pillar } from './pillars';
 
 // ---- NAMING / PATHS -----------------------------------------------------
 
@@ -89,22 +85,27 @@ export function organizedRootPath(sourceRootPath: string): string {
   return path.join(path.resolve(sourceRootPath), ORGANIZED_ROOT_NAME);
 }
 
-export function collectionDir(sourceRootPath: string, collectionId: string): string {
-  return path.join(organizedRootPath(sourceRootPath), collectionId);
+/** `clientSlug` (a `clients.map.json` key) scopes the collection to
+ * `HITLOOP-ARCHIVE/<clientSlug>/<collectionId>/`; omitted/null = the legacy
+ * top-level `HITLOOP-ARCHIVE/<collectionId>/` (home client). */
+export function collectionDir(sourceRootPath: string, collectionId: string, clientSlug?: string | null): string {
+  return clientSlug
+    ? path.join(organizedRootPath(sourceRootPath), clientSlug, collectionId)
+    : path.join(organizedRootPath(sourceRootPath), collectionId);
 }
 
-export function pillarDir(sourceRootPath: string, collectionId: string, pillarOrUnsorted: string): string {
-  return path.join(collectionDir(sourceRootPath, collectionId), pillarOrUnsorted);
+export function pillarDir(sourceRootPath: string, collectionId: string, pillarOrUnsorted: string, clientSlug?: string | null): string {
+  return path.join(collectionDir(sourceRootPath, collectionId, clientSlug), pillarOrUnsorted);
 }
 
-export function collectionMetaDir(sourceRootPath: string, collectionId: string): string {
-  return path.join(collectionDir(sourceRootPath, collectionId), '_meta');
+export function collectionMetaDir(sourceRootPath: string, collectionId: string, clientSlug?: string | null): string {
+  return path.join(collectionDir(sourceRootPath, collectionId, clientSlug), '_meta');
 }
 
 /** Absolute organize target path for a filename inside a collection/pillar
  * bucket, before any collision suffix is applied. */
-export function targetPath(sourceRootPath: string, collectionId: string, pillarOrUnsorted: string, filename: string): string {
-  return path.join(pillarDir(sourceRootPath, collectionId, pillarOrUnsorted), filename);
+export function targetPath(sourceRootPath: string, collectionId: string, pillarOrUnsorted: string, filename: string, clientSlug?: string | null): string {
+  return path.join(pillarDir(sourceRootPath, collectionId, pillarOrUnsorted, clientSlug), filename);
 }
 
 /** ` (<sha12>)` inserted before the extension on a same-folder filename
@@ -124,12 +125,24 @@ export function isUnderOrganizedRoot(sourceRootPath: string, candidateAbsolutePa
   return candidate === root || (candidate + path.sep).startsWith(root + path.sep);
 }
 
-/** Parses a `HITLOOP-ARCHIVE/<collectionId>/...` path (relative to the
- * source root, as stored in `organize_moves`/`moves.jsonl`) back to its
- * collectionId. Returns null for anything not shaped like an organized path.
- * Used by `UNDO_ORGANIZE` to find which collection's journal to append to. */
-export function collectionIdFromOrganizedRelativePath(relativePath: string): string | null {
+/** Parses an organized path (relative to the source root, as stored in
+ * `organize_moves`/`moves.jsonl`) back to its collection: either legacy
+ * `HITLOOP-ARCHIVE/<collectionId>/<pillar>/...` or client-scoped
+ * `HITLOOP-ARCHIVE/<clientSlug>/<collectionId>/<pillar>/...`. The slug
+ * reading is `clientSlugForPath`'s (one rule: a known slug segment followed by
+ * a pillar/`_unsorted`/`_meta` is a legacy collection sharing the slug's
+ * name), so attribution and journal lookup always agree. Returns null for
+ * anything not shaped like an organized path. */
+export function organizedCollectionFromRelativePath(relativePath: string, map: ClientsMap = CLIENTS_MAP): { collectionId: string; clientSlug: string | null } | null {
   const parts = relativePath.split(/[\\/]+/).filter(Boolean);
   if (parts[0] !== ORGANIZED_ROOT_NAME || !parts[1]) return null;
-  return parts[1];
+  const slug = clientSlugForPath(relativePath, map);
+  if (slug && parts[2]) return { collectionId: parts[2], clientSlug: slug };
+  return { collectionId: parts[1], clientSlug: null };
+}
+
+/** collectionId only (skips a known client slug segment). Used by
+ * `UNDO_ORGANIZE` to find which collection's journal to append to. */
+export function collectionIdFromOrganizedRelativePath(relativePath: string, map: ClientsMap = CLIENTS_MAP): string | null {
+  return organizedCollectionFromRelativePath(relativePath, map)?.collectionId ?? null;
 }

@@ -5,6 +5,7 @@ import { HOME_DIR, readCache } from './analyze';
 import { API_VERSION, BATCH_URL, parseBatchResults, readBatches, saveBatchItem, writeBatches, type BatchResp, type BatchRow } from './batch';
 import { BATCH_DISCOUNT, cacheKey, callCostUsd, round6 } from './cost';
 import { organizeCopy } from './nas';
+import { withClientId } from '../clients';
 import { DEFAULT_MODEL, PROMPT_VERSION } from './schema';
 import { resolveUnder, type ReadOnlyStore } from './store';
 import type { AnalyzerControl, ResultItem } from './control';
@@ -112,7 +113,7 @@ export async function collectPersistedBatches(deps: CollectDeps): Promise<{ batc
               try { organizedPath = await organizeCopy({ rootPath: source.rootPath, sourceId: source.id, sha256: sha, originalAbs: abs, originalRelativePath: rel, entry, thumbDir, hashFile: deps.hashFile }); }
               catch { /* organize is best effort, as in the batch save loop */ }
             }
-            out.push({ ...entry, relativePath: rel, costUsd: itemCost, ...(organizedPath ? { organizedPath } : {}) });
+            out.push(withClientId({ ...entry, relativePath: rel, costUsd: itemCost, ...(organizedPath ? { organizedPath } : {}) }));
             saved++;
             if (out.length >= PUSH_BATCH) await flush();
           } catch { errors++; }

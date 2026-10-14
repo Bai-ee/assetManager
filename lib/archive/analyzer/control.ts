@@ -14,6 +14,8 @@ export interface ResultItem {
   jev: unknown; model: string; promptVersion: string; costUsd: number;
   /** Organized copy, relative to the source root. */
   organizedPath?: string;
+  /** HITLOOP clientId when the path sits under a `clients.map.json` slug; omitted for home/legacy items. */
+  clientId?: string;
 }
 
 export const CAPABILITIES = ['ANALYZE_FACETS', 'STAGE_FOR_PUBLISH', 'CANCEL_JOB', 'COLLECT_BATCHES'];

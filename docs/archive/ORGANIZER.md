@@ -98,6 +98,41 @@ Filenames are kept verbatim. A same-folder collision (two different assets
 that would land on the same filename) gets ` (<sha12>)` inserted before the
 extension on the second one (`withCollisionSuffix`).
 
+### Per-client NAS (`lib/archive/clients.map.json`)
+
+A committed map `{ "<client-slug>": "<HITLOOP clientId>" }` (lowercase-kebab
+slugs, ids `[A-Za-z0-9_-]{3,80}`, validated at load: a bad entry throws) scopes
+content to a client. Home is never listed. `clientForPath()` in
+`lib/archive/clients.ts` resolves a source-root-relative path:
+`HITLOOP-ARCHIVE/<slug>/...` or `<slug>/...` at the source root -> that client;
+anything else (legacy top-level collections, unknown folders) -> null.
+`HITLOOP-ARCHIVE/<slug>/<pillar|_unsorted|_meta>/...` is read as a legacy
+collection that shares the slug's name (same rule in `clients.ts` and `scheme.ts`).
+
+Rules:
+- A slug must not equal an existing legacy collection id. Reserved slugs:
+  `content`, `root`, `hitloop-archive`, and the six pillar names.
+- A source-root folder named exactly like a slug (`<slug>/...`, case-sensitive)
+  is treated as that client's drop folder. Keep home content out of such names.
+- The organizer rejects a legacy (home) collection whose id equals a slug, and an
+  item selection that mixes client folders (or a client with home items).
+
+- Organizer: a selection under `<slug>/...` (items: every item must agree)
+  lands in `HITLOOP-ARCHIVE/<slug>/<collectionId>/<pillar>/` (same `_meta`,
+  journal and undo, one level deeper). `collectionId` is still
+  `slugifyCollectionId(selectedRelativePath)`, so it matches HITLOOP's id.
+  `plan.clientSlug` carries the scope; legacy plans omit it and are unchanged.
+- Analyzer copy: client items go to `HITLOOP-ARCHIVE/<slug>/content/<kind>/<year>/`;
+  `_meta` sidecars stay in the shared `HITLOOP-ARCHIVE/content/_meta/` (keyed by sha).
+- Wire: analyzer result items carry `clientId` from their own `relativePath` only
+  (never `organizedPath`, since sha-keyed sidecars are shared). Asset-sync payloads
+  carry `clientId` only when every location of the asset maps to the same client.
+  Home/legacy/mixed send no `clientId` and HITLOOP falls back.
+- Undo: tries the client location first, then always the legacy top-level
+  location, so collections organized before this change still undo.
+
+To add a client, add one line to `clients.map.json` (public ids only).
+
 ## Commands
 
 Both are handled in `daemon.ts`'s `execute()`, alongside the existing
