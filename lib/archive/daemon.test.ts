@@ -46,6 +46,22 @@ function collectionCommand(id: string, sourceId: string) {
   return { id, type: 'PROCESS_COLLECTION' as const, workerId: 'test-worker', sourceId, relativePath: '.', state: 'QUEUED' as const };
 }
 
+function organizeCommand(id: string, sourceId: string, mode?: 'plan' | 'apply') {
+  return { id, type: 'ORGANIZE_COLLECTION' as const, workerId: 'test-worker', sourceId, relativePath: '.', state: 'QUEUED' as const, mode };
+}
+
+function undoOrganizeCommand(id: string, sourceId: string, organizeJobId?: string) {
+  return { id, type: 'UNDO_ORGANIZE' as const, workerId: 'test-worker', sourceId, relativePath: '.', state: 'QUEUED' as const, organizeJobId };
+}
+
+function selectionCommand(id: string, sourceId: string, items: Array<{ relativePath: string; kind: 'file' | 'folder' }>, collectionId = 'my-selection') {
+  return { id, type: 'PROCESS_SELECTION' as const, workerId: 'test-worker', sourceId, state: 'QUEUED' as const, items, collectionId };
+}
+
+function organizeItemsCommand(id: string, sourceId: string, items: Array<{ relativePath: string; kind: 'file' | 'folder' }>, collectionId = 'my-selection', mode?: 'plan' | 'apply') {
+  return { id, type: 'ORGANIZE_COLLECTION' as const, workerId: 'test-worker', sourceId, state: 'QUEUED' as const, items, collectionId, mode };
+}
+
 function uploadJsonCommand(overrides: Partial<{
   id: string; kind: 'archive-record' | 'collection-manifest' | 'viewer';
   fileName: string; contentType: string; payload: unknown;
@@ -558,6 +574,659 @@ test('UPLOAD_JSON command carries no sourceId and never triggers the "Unknown so
 
   assert.equal(control.commands.some((c: any) => c.state === 'FAILED' && /Unknown source/.test(c.error || '')), false);
   assert.equal(control.commands.some((c: any) => c.state === 'COMPLETE'), true);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('ORGANIZE_COLLECTION {mode:"plan"} returns the move list without touching disk or syncing anything', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  await worker.run(worker.createJob(source.id, '.').id);
+
+  await (daemon as any).execute(organizeCommand('cmd-plan', source.id, 'plan'));
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-plan' && c.state === 'COMPLETE');
+  assert.ok(completed);
+  assert.equal(completed.result.mode, 'plan');
+  assert.equal(completed.result.plan.moves.length, 1);
+  assert.equal(completed.result.plan.moves[0].from, 'clip.mp4');
+
+  const exists = (p: string) => fs.access(p).then(() => true, () => false);
+  assert.equal(await exists(path.join(f.sourceRoot, 'clip.mp4')), true);
+  assert.equal(await exists(path.join(f.sourceRoot, 'HITLOOP-ARCHIVE')), false);
+  assert.equal(control.synced.length, 0);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('ORGANIZE_COLLECTION {mode:"apply"} moves the file and syncs the organized field; UNDO_ORGANIZE (resolved by relativePath) restores it', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  await worker.run(worker.createJob(source.id, '.').id);
+
+  await (daemon as any).execute(organizeCommand('cmd-apply', source.id, 'apply'));
+
+  const exists = (p: string) => fs.access(p).then(() => true, () => false);
+  const applied = control.commands.find((c: any) => c.commandId === 'cmd-apply' && c.state === 'COMPLETE');
+  assert.ok(applied);
+  assert.equal(applied.result.moved.length, 1);
+  const movedTo = applied.result.moved[0].to;
+  assert.equal(await exists(path.join(f.sourceRoot, 'clip.mp4')), false);
+  assert.equal(await exists(path.join(f.sourceRoot, movedTo)), true);
+
+  const organizedSync = control.synced.find((s: any) => s.asset.organized);
+  assert.ok(organizedSync, 'daemon must sync the organized field for the moved asset');
+  assert.equal(organizedSync.asset.organized.path, movedTo);
+  assert.ok(organizedSync.asset.organized.appliedAt);
+
+  // No explicit organizeJobId: the daemon derives collectionId from
+  // relativePath and finds the latest organize job for it.
+  await (daemon as any).execute(undoOrganizeCommand('cmd-undo', source.id));
+  const undone = control.commands.find((c: any) => c.commandId === 'cmd-undo' && c.state === 'COMPLETE');
+  assert.ok(undone);
+  assert.equal(undone.result.restored.length, 1);
+  assert.equal(await exists(path.join(f.sourceRoot, 'clip.mp4')), true);
+  assert.equal(await exists(path.join(f.sourceRoot, movedTo)), false);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('LIST_DIRECTORY result carries entries (folder + file with size/ext/movable) alongside the unchanged folders array', async () => {
+  const f = await fixture();
+  await fs.mkdir(path.join(f.sourceRoot, 'Housepit'));
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes long enough');
+  await fs.writeFile(path.join(f.sourceRoot, '.DS_Store'), 'junk');
+  await fs.writeFile(path.join(f.sourceRoot, '._clip.mp4'), 'appledouble junk');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  const command = { id: 'cmd-list', type: 'LIST_DIRECTORY' as const, workerId: 'test-worker', sourceId: source.id, relativePath: '.', state: 'QUEUED' as const };
+  await (daemon as any).execute(command);
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-list' && c.state === 'COMPLETE');
+  assert.ok(completed);
+  const { result } = completed;
+  assert.deepEqual(result.folders, ['Housepit']); // compat shape unchanged
+  assert.equal(result.counts.folders, 1);
+  assert.equal(result.counts.files, 1);
+
+  assert.equal(result.entries.length, 2);
+  assert.deepEqual(result.entries[0], { name: 'Housepit', kind: 'folder' });
+  const fileEntry = result.entries[1];
+  assert.equal(fileEntry.name, 'clip.mp4');
+  assert.equal(fileEntry.kind, 'file');
+  assert.equal(fileEntry.ext, 'mp4');
+  assert.equal(fileEntry.movable, true);
+  assert.equal(typeof fileEntry.sizeBytes, 'number');
+  assert.ok(fileEntry.sizeBytes > 0);
+  assert.ok(fileEntry.modifiedAt);
+  assert.ok(!Number.isNaN(Date.parse(fileEntry.modifiedAt)));
+
+  // Hidden/artifact names never surface.
+  assert.equal(result.entries.some((e: any) => e.name === '.DS_Store' || e.name === '._clip.mp4'), false);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('run(): the browse lane completes a LIST_DIRECTORY command while a slower main-lane command is still executing', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+  const events: string[] = [];
+  let mainServed = false;
+  let browseServed = false;
+  (control as any).pollCommands = async (_workerId: string, opts?: { types?: string[]; excludeTypes?: string[] }) => {
+    if (opts?.types?.includes('LIST_DIRECTORY')) {
+      if (browseServed) return [];
+      browseServed = true;
+      return [{ id: 'browse-1', type: 'LIST_DIRECTORY', workerId: 'test-worker', sourceId: 'src-1', relativePath: '.', state: 'QUEUED' }];
+    }
+    if (mainServed) return [];
+    mainServed = true;
+    return [{ id: 'main-1', type: 'PROCESS_COLLECTION', workerId: 'test-worker', sourceId: 'src-1', relativePath: '.', state: 'QUEUED' }];
+  };
+
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  // Isolate loop-scheduling behavior from real execute() business logic
+  // (which needs a registered source with real files for PROCESS_COLLECTION):
+  // the main-lane command takes 150ms, the browse-lane command takes 10ms.
+  (daemon as any).execute = async (command: any) => {
+    const delay = command.id === 'main-1' ? 150 : 10;
+    await new Promise(resolve => setTimeout(resolve, delay));
+    events.push(`${command.id} done`);
+    await control.updateCommand({ commandId: command.id, state: 'COMPLETE' });
+  };
+
+  const runPromise = daemon.run(20, 20);
+  try {
+    // Give both loops a chance to claim their command and let the fast
+    // browse-lane command finish, well before the slow main-lane one can.
+    await new Promise(resolve => setTimeout(resolve, 70));
+    assert.ok(events.includes('browse-1 done'), 'browse lane must already have completed LIST_DIRECTORY');
+    assert.equal(events.includes('main-1 done'), false, 'main-lane command must still be in flight');
+
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.ok(events.includes('main-1 done'), 'main-lane command eventually completes');
+  } finally {
+    daemon.stop();
+    await runPromise;
+  }
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('run(): the main lane never claims LIST_DIRECTORY and the browse lane never claims other types', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+  // A shared in-memory queue, filtered exactly like the real HITLOOP route
+  // (types include-list / excludeTypes exclude-list), so a command is only
+  // ever handed to the lane whose filter it actually matches.
+  const queue: Array<{ id: string; type: string }> = [
+    { id: 'q1', type: 'PROCESS_COLLECTION' },
+    { id: 'q2', type: 'LIST_DIRECTORY' },
+    { id: 'q3', type: 'ORGANIZE_COLLECTION' },
+    { id: 'q4', type: 'LIST_DIRECTORY' },
+  ];
+  const claims: Array<{ id: string; type: string; opts: any }> = [];
+  (control as any).pollCommands = async (_workerId: string, opts?: { types?: string[]; excludeTypes?: string[] }) => {
+    const matches = queue.filter(c => (opts?.types ? opts.types.includes(c.type) : true) && (opts?.excludeTypes ? !opts.excludeTypes.includes(c.type) : true));
+    for (const m of matches) {
+      const idx = queue.indexOf(m);
+      if (idx !== -1) queue.splice(idx, 1); // claimed: no longer QUEUED
+    }
+    return matches.map(m => ({ ...m, workerId: 'test-worker', sourceId: 'src-1', relativePath: '.', state: 'QUEUED' as const }));
+  };
+
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+  (daemon as any).execute = async (command: any) => {
+    claims.push({ id: command.id, type: command.type, opts: command.__claimedWithOpts });
+    await control.updateCommand({ commandId: command.id, state: 'COMPLETE' });
+  };
+  // Tag each claimed command with the opts it was claimed under, by wrapping pollCommands once more.
+  const rawPoll = (control as any).pollCommands.bind(control);
+  (control as any).pollCommands = async (workerId: string, opts?: any) => {
+    const commands = await rawPoll(workerId, opts);
+    return commands.map((c: any) => ({ ...c, __claimedWithOpts: opts }));
+  };
+
+  const runPromise = daemon.run(15, 15);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(queue.length, 0, 'all seeded commands were eventually claimed by one lane or the other');
+  } finally {
+    daemon.stop();
+    await runPromise;
+  }
+
+  assert.equal(claims.length, 4);
+  for (const claim of claims) {
+    if (claim.type === 'LIST_DIRECTORY') {
+      assert.ok(claim.opts?.types?.includes('LIST_DIRECTORY'), `${claim.id} (LIST_DIRECTORY) must be claimed via the browse lane's types filter`);
+      assert.equal(claim.opts?.excludeTypes, undefined);
+    } else {
+      assert.ok(claim.opts?.excludeTypes?.includes('LIST_DIRECTORY'), `${claim.id} (${claim.type}) must be claimed via the main lane's excludeTypes filter`);
+      assert.equal(claim.opts?.types, undefined);
+    }
+  }
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('UNDO_ORGANIZE fails cleanly when no organize job exists for the collection', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  await worker.run(worker.createJob(source.id, '.').id);
+
+  // Matches the existing convention for other early-validation throws in
+  // execute() (e.g. "Unknown source"): only the run()-loop wrapper turns
+  // these into a FAILED command update; a direct execute() call rejects.
+  await assert.rejects(() => (daemon as any).execute(undoOrganizeCommand('cmd-undo-none', source.id)), /No organize job found/);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('PROCESS_SELECTION hashes a folder item + a file item, syncs assets, and completes like PROCESS_COLLECTION', async () => {
+  const f = await fixture();
+  await fs.mkdir(path.join(f.sourceRoot, 'folderA'), { recursive: true });
+  await fs.writeFile(path.join(f.sourceRoot, 'folderA', 'clip.mp4'), 'video bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'loose.jpg'), 'image bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'not-selected.jpg'), 'excluded bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  const items = [
+    { relativePath: 'folderA', kind: 'folder' as const },
+    { relativePath: 'loose.jpg', kind: 'file' as const },
+  ];
+  await (daemon as any).execute(selectionCommand('cmd-selection', source.id, items, 'my-selection'));
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-selection' && c.state === 'COMPLETE');
+  assert.ok(completed);
+
+  const rows = f.db.db.prepare('SELECT relative_path FROM file_locations').all() as Array<{ relative_path: string }>;
+  assert.deepEqual(rows.map(r => r.relative_path).sort(), [path.join('folderA', 'clip.mp4'), 'loose.jpg']);
+
+  // not-selected.jpg was never discovered at all.
+  assert.equal(rows.some(r => r.relative_path === 'not-selected.jpg'), false);
+
+  assert.equal(control.synced.length, 2);
+  const syncedPaths = control.synced.flatMap((s: any) => s.asset.sourcePaths);
+  assert.ok(syncedPaths.includes(path.join('folderA', 'clip.mp4')));
+  assert.ok(syncedPaths.includes('loose.jpg'));
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('PROCESS_SELECTION validation failures reject with a clear error (bad collectionId, empty items, escaping item, item inside HITLOOP-ARCHIVE)', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  await assert.rejects(
+    () => (daemon as any).execute(selectionCommand('cmd-bad-collection', source.id, [{ relativePath: 'clip.mp4', kind: 'file' }], 'Not Valid!')),
+    /valid collectionId/,
+  );
+  await assert.rejects(
+    () => (daemon as any).execute(selectionCommand('cmd-empty-items', source.id, [], 'my-selection')),
+    /at least one selection item/i,
+  );
+  await assert.rejects(
+    () => (daemon as any).execute(selectionCommand('cmd-escape', source.id, [{ relativePath: '../outside', kind: 'folder' }], 'my-selection')),
+    /escapes source root/,
+  );
+  await assert.rejects(
+    () => (daemon as any).execute(selectionCommand('cmd-archive-item', source.id, [{ relativePath: 'HITLOOP-ARCHIVE/root/_unsorted', kind: 'folder' }], 'my-selection')),
+    /inside HITLOOP-ARCHIVE/,
+  );
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('run()-loop: a PROCESS_SELECTION validation failure (escaping item) is reported as FAILED, not thrown out of the poll loop', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  (control as any).pollCommands = async () => {
+    (control as any).pollCommands = async () => [];
+    return [selectionCommand('cmd-invalid', source.id, [{ relativePath: '../outside', kind: 'folder' }])];
+  };
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const runPromise = daemon.run(15, 15);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 100));
+    const failed = control.commands.find((c: any) => c.commandId === 'cmd-invalid' && c.state === 'FAILED');
+    assert.ok(failed, 'expected the command to be reported FAILED, not thrown');
+    assert.match(failed.error, /escapes source root/);
+  } finally {
+    daemon.stop();
+    await runPromise;
+  }
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('ORGANIZE_COLLECTION{items} plans/applies scoped to the selection under HITLOOP-ARCHIVE/<collectionId>/…, and UNDO_ORGANIZE{collectionId} restores it', async () => {
+  const f = await fixture();
+  await fs.mkdir(path.join(f.sourceRoot, 'folderA'), { recursive: true });
+  await fs.writeFile(path.join(f.sourceRoot, 'folderA', 'clip.mp4'), 'video bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'loose.jpg'), 'image bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'other.jpg'), 'other bytes'); // never selected
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  await worker.run(worker.createJob(source.id, '.').id); // hash everything first
+
+  const items = [
+    { relativePath: 'folderA', kind: 'folder' as const },
+    { relativePath: 'loose.jpg', kind: 'file' as const },
+  ];
+
+  await (daemon as any).execute(organizeItemsCommand('cmd-items-plan', source.id, items, 'my-picks', 'plan'));
+  const planned = control.commands.find((c: any) => c.commandId === 'cmd-items-plan' && c.state === 'COMPLETE');
+  assert.ok(planned);
+  assert.equal(planned.result.mode, 'plan');
+  assert.equal(planned.result.plan.moves.length, 2);
+  assert.equal(planned.result.plan.collectionId, 'my-picks');
+
+  const exists = (p: string) => fs.access(p).then(() => true, () => false);
+  assert.equal(await exists(path.join(f.sourceRoot, 'HITLOOP-ARCHIVE')), false); // plan writes nothing
+
+  await (daemon as any).execute(organizeItemsCommand('cmd-items-apply', source.id, items, 'my-picks', 'apply'));
+  const applied = control.commands.find((c: any) => c.commandId === 'cmd-items-apply' && c.state === 'COMPLETE');
+  assert.ok(applied);
+  assert.equal(applied.result.moved.length, 2);
+  for (const move of applied.result.moved) {
+    assert.match(move.to, new RegExp(`^HITLOOP-ARCHIVE[\\\\/]my-picks[\\\\/]`));
+    assert.equal(await exists(path.join(f.sourceRoot, move.to)), true);
+  }
+  assert.equal(await exists(path.join(f.sourceRoot, 'folderA', 'clip.mp4')), false);
+  assert.equal(await exists(path.join(f.sourceRoot, 'loose.jpg')), false);
+  assert.equal(await exists(path.join(f.sourceRoot, 'other.jpg')), true); // untouched
+
+  // UNDO_ORGANIZE resolved purely by collectionId (no relativePath/organizeJobId).
+  const undoCommand = { id: 'cmd-items-undo', type: 'UNDO_ORGANIZE' as const, workerId: 'test-worker', sourceId: source.id, state: 'QUEUED' as const, collectionId: 'my-picks' };
+  await (daemon as any).execute(undoCommand);
+  const undone = control.commands.find((c: any) => c.commandId === 'cmd-items-undo' && c.state === 'COMPLETE');
+  assert.ok(undone);
+  assert.equal(undone.result.restored.length, 2);
+  assert.equal(await exists(path.join(f.sourceRoot, 'folderA', 'clip.mp4')), true);
+  assert.equal(await exists(path.join(f.sourceRoot, 'loose.jpg')), true);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+function cancelJobCommand(id: string, sourceId: string, overrides: { jobId?: string; targetCommandId?: string } = {}) {
+  return { id, type: 'CANCEL_JOB' as const, workerId: 'test-worker', sourceId, state: 'QUEUED' as const, ...overrides };
+}
+
+test('CANCEL_JOB cancels the job currently active in the main lane and replies COMPLETE with hashedSoFar', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 50; i++) {
+    await fs.writeFile(path.join(f.sourceRoot, `file-${String(i).padStart(3, '0')}.txt`), `bytes-${i}`);
+  }
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  // Simulate the main lane being mid-run(): manually populate the daemon's
+  // activeJob tracking the way execute()'s PROCESS_COLLECTION path would,
+  // and call cancel() through it directly, rather than actually racing two
+  // concurrent execute() calls (covered by the run()-loop test below).
+  const mainWorker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const job = mainWorker.createJob(source.id, '.');
+  (daemon as any).activeJob = { jobId: job.id, commandId: 'main-cmd', worker: mainWorker };
+  mainWorker.cancel(job.id); // pre-set so run() cancels almost immediately below
+  await mainWorker.run(job.id);
+  assert.equal(f.db.getJob(job.id)?.state, 'CANCELLED');
+
+  await (daemon as any).execute(cancelJobCommand('cmd-cancel', source.id));
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-cancel' && c.state === 'COMPLETE');
+  assert.ok(completed, 'CANCEL_JOB command must reach COMPLETE');
+  assert.equal(completed.result.cancelled, true);
+  assert.equal(completed.result.jobId, job.id);
+  assert.equal(typeof completed.result.hashedSoFar, 'number');
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('CANCEL_JOB with no active job falls back to failing a QUEUED target command by id', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  await (daemon as any).execute(cancelJobCommand('cmd-cancel-queued', source.id, { targetCommandId: 'queued-process-cmd' }));
+
+  assert.deepEqual(
+    control.commands.filter((c: any) => c.commandId === 'queued-process-cmd').map((c: any) => c.state),
+    ['FAILED'],
+  );
+  const failedTarget = control.commands.find((c: any) => c.commandId === 'queued-process-cmd');
+  assert.equal(failedTarget.error, 'CANCELLED');
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-cancel-queued' && c.state === 'COMPLETE');
+  assert.ok(completed);
+  assert.equal(completed.result.cancelled, true);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('CANCEL_JOB fails cleanly when nothing is active and no targetCommandId is given', async () => {
+  const f = await fixture();
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  await (daemon as any).execute(cancelJobCommand('cmd-cancel-nothing', source.id));
+
+  const failed = control.commands.find((c: any) => c.commandId === 'cmd-cancel-nothing' && c.state === 'FAILED');
+  assert.ok(failed);
+  assert.match(failed.error, /No active or queued job/);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('PROCESS_COLLECTION: a mid-run CANCEL_JOB stops the walk, marks the job CANCELLED, and fails the ORIGINAL command with the kept-hashed-count error (no analysis/sync)', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 5; i++) {
+    await fs.writeFile(path.join(f.sourceRoot, `file-${i}.mp4`), `video-bytes-${i}`);
+  }
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  // Race a real execute(PROCESS_COLLECTION) against a CANCEL_JOB the moment
+  // the daemon reports activeJob is set — proving the browse lane's
+  // CANCEL_JOB can actually reach and stop the main lane while it's busy
+  // inside worker.run(). The daemon's own internally-constructed worker uses
+  // the default 2000ms stableFileDwellMs, so this genuinely lands the cancel
+  // while the worker is mid-file (inside waitForStableFile) — the test just
+  // takes ~2s wall-clock as a result, not a flaky race.
+  const mainExecutePromise = (daemon as any).execute(collectionCommand('cmd-main', source.id));
+  while (!(daemon as any).activeJob) await new Promise(r => setTimeout(r, 1));
+  await (daemon as any).execute(cancelJobCommand('cmd-cancel', source.id));
+  await mainExecutePromise;
+
+  const mainFinal = control.commands.filter((c: any) => c.commandId === 'cmd-main').pop();
+  assert.equal(mainFinal.state, 'FAILED');
+  assert.match(mainFinal.error, /CANCELLED by owner \(kept \d+ hashed files\)/);
+
+  // No analysis/sync ran for the cancelled job.
+  assert.equal(control.synced.length, 0);
+
+  assert.equal((daemon as any).activeJob, undefined, 'activeJob must be cleared once the main lane finishes');
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('run(): the browse lane claims CANCEL_JOB while a slow main-lane PROCESS_COLLECTION is still executing, and the main-lane command ends FAILED with the CANCELLED error', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 5; i++) {
+    await fs.writeFile(path.join(f.sourceRoot, `file-${i}.mp4`), `video-bytes-${i}`);
+  }
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  let mainServed = false;
+  let cancelServed = false;
+  (control as any).pollCommands = async (_workerId: string, opts?: { types?: string[]; excludeTypes?: string[] }) => {
+    if (opts?.types?.includes('CANCEL_JOB')) {
+      // Only issue the cancel once the main lane has actually claimed and
+      // started its command (activeJob set), so this exercises the real
+      // "claimed while busy" race rather than cancelling before anything runs.
+      if (cancelServed || !(daemon as any).activeJob) return [];
+      cancelServed = true;
+      return [cancelJobCommand('cmd-cancel', source.id)];
+    }
+    if (mainServed) return [];
+    mainServed = true;
+    return [collectionCommand('cmd-main', source.id)];
+  };
+
+  const runPromise = daemon.run(15, 15);
+  try {
+    // The daemon's own internally-constructed worker uses the default 2000ms
+    // stableFileDwellMs, so the main-lane command genuinely takes ~2s to
+    // reach its terminal state once cancelled mid-file — poll for it instead
+    // of a short fixed sleep (which was the whole point of the earlier
+    // scheduling-only LIST_DIRECTORY test, but this one needs to observe the
+    // real cancellation outcome, not just which lane claimed what).
+    const deadline = Date.now() + 8000;
+    let mainFinal: any;
+    while (Date.now() < deadline) {
+      mainFinal = control.commands.filter((c: any) => c.commandId === 'cmd-main').pop();
+      if (mainFinal?.state === 'FAILED' || mainFinal?.state === 'COMPLETE') break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    assert.ok(cancelServed, 'the browse lane must have claimed the CANCEL_JOB command');
+    assert.ok(mainFinal, 'main-lane command must have reported at least one state update');
+    assert.equal(mainFinal.state, 'FAILED');
+    assert.match(mainFinal.error, /CANCELLED by owner/);
+  } finally {
+    daemon.stop();
+    await runPromise;
+  }
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('PROCESS_SELECTION mediaOnly:true skips non-media items and reports skippedNonMedia on the COMPLETE result', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'track.wav'), 'audio bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  const items = [
+    { relativePath: 'clip.mp4', kind: 'file' as const },
+    { relativePath: 'track.wav', kind: 'file' as const },
+  ];
+  const command = { ...selectionCommand('cmd-media-only', source.id, items, 'media-only-sel'), mediaOnly: true };
+  await (daemon as any).execute(command);
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-media-only' && c.state === 'COMPLETE');
+  assert.ok(completed);
+  assert.equal(completed.result?.skippedNonMedia, 1);
+
+  const rows = f.db.db.prepare('SELECT relative_path FROM file_locations').all() as Array<{ relative_path: string }>;
+  assert.deepEqual(rows.map(r => r.relative_path), ['clip.mp4']);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('PROCESS_COLLECTION without mediaOnly hashes every file, unchanged (no skippedNonMedia on the result)', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+  await fs.writeFile(path.join(f.sourceRoot, 'track.wav'), 'audio bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+
+  await (daemon as any).execute(collectionCommand('cmd-no-media-only', source.id));
+
+  const completed = control.commands.find((c: any) => c.commandId === 'cmd-no-media-only' && c.state === 'COMPLETE');
+  assert.ok(completed);
+  assert.equal(completed.result, undefined);
+
+  const rows = f.db.db.prepare('SELECT relative_path FROM file_locations').all() as Array<{ relative_path: string }>;
+  assert.deepEqual(rows.map(r => r.relative_path).sort(), ['clip.mp4', 'track.wav']);
+
+  f.db.close();
+  await fs.rm(f.dir, { recursive: true, force: true });
+});
+
+test('ORGANIZE_COLLECTION{items} validation failures reject with a clear error (missing collectionId, item inside HITLOOP-ARCHIVE)', async () => {
+  const f = await fixture();
+  await fs.writeFile(path.join(f.sourceRoot, 'clip.mp4'), 'video bytes');
+
+  const control = fakeControl();
+  const analysis = new ArchiveAnalysisService(f.db, { configured: false } as any);
+  const daemon = new ArchiveDaemon(f.db, control as any, 'test-worker', analysis, new JevDecisionService({ decide: async () => { throw new Error('not reached'); } } as any));
+
+  const worker = new ArchiveWorker(f.db, { stableFileDwellMs: 0 });
+  const source = await worker.registerSource('test', f.sourceRoot);
+  await worker.run(worker.createJob(source.id, '.').id);
+
+  const missingCollectionId = { id: 'cmd-no-cid', type: 'ORGANIZE_COLLECTION' as const, workerId: 'test-worker', sourceId: source.id, state: 'QUEUED' as const, items: [{ relativePath: 'clip.mp4', kind: 'file' as const }] };
+  await assert.rejects(() => (daemon as any).execute(missingCollectionId), /valid collectionId/);
+
+  await assert.rejects(
+    () => (daemon as any).execute(organizeItemsCommand('cmd-archive-item', source.id, [{ relativePath: 'HITLOOP-ARCHIVE/root', kind: 'folder' }], 'my-picks')),
+    /inside HITLOOP-ARCHIVE/,
+  );
 
   f.db.close();
   await fs.rm(f.dir, { recursive: true, force: true });

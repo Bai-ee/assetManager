@@ -31,7 +31,11 @@ NAS → inventory/hash/dedupe → media observation → normalized Asset State �
 
 ## Non-negotiable invariants
 
-1. NAS originals are read-only. Never move, rename or delete source files.
+1. NAS originals outside `HITLOOP-ARCHIVE/` are read-only. Never move, rename
+   or delete source files, with one narrow, restored 2026-09-20 exception: the
+   organizer (`lib/archive/organize/*`) may move a canonical video/image
+   location into that one owned root, journaled and reversible via
+   `UNDO_ORGANIZE` (see `docs/archive/ORGANIZER.md` and DECISIONS.md D002/D003).
 2. Exact identity is streaming SHA-256 of bytes. Filename is not identity.
 3. Duplicate paths remain provenance even when they resolve to one content asset.
 4. Browser is a control surface, not the bulk file transport.
@@ -39,7 +43,10 @@ NAS → inventory/hash/dedupe → media observation → normalized Asset State �
 6. Raw media never goes to Jev. Perception creates compact evidence / Asset State; Jev classifies that state.
 7. AI observations are not confirmed facts. Human correction/confirmation is retained separately.
 8. Reviewed SHA-256 must equal SHA-256 immediately before permanent upload.
-9. Permanent upload requires explicit human approval and an Arweave cost checkpoint.
+9. Permanent upload requires explicit human approval and an Arweave cost
+   checkpoint. **Restored 2026-09-20** (DECISIONS.md D009/D010): no automatic
+   permanent upload under any condition, including once an asset is
+   documented — approval + a live quote are required every time.
 10. Permanent viewer must work without HITLOOP, Firebase or operator authentication.
 11. Never log or commit API keys, worker bearer tokens or Arweave wallet JWK material.
 

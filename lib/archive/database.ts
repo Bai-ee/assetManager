@@ -65,6 +65,45 @@ export class ArchiveDatabase {
       CREATE INDEX IF NOT EXISTS idx_jev_asset ON jev_decisions(content_asset_id);
       CREATE INDEX IF NOT EXISTS idx_jev_status ON jev_decisions(status);
     `);
+
+    // Organizer support (W-B, docs/plans/ARCHIVE-NAS-STAGING-MASTER-PLAN-2026-09-20.md
+    // §3b): where a canonical location was moved to inside
+    // `<rootPath>/HITLOOP-ARCHIVE/…`, plus a SQLite mirror of the append-only
+    // move journal so UNDO_ORGANIZE works even if the NAS `_meta` sidecar file
+    // is lost. Guarded ALTER so migrate() stays idempotent on an existing DB
+    // (SQLite has no `ADD COLUMN IF NOT EXISTS`).
+    const fileLocationColumns = this.db.prepare("PRAGMA table_info(file_locations)").all() as Array<{ name: string }>;
+    if (!fileLocationColumns.some(c => c.name === 'organized_path')) {
+      this.db.exec('ALTER TABLE file_locations ADD COLUMN organized_path TEXT');
+      this.db.exec('ALTER TABLE file_locations ADD COLUMN organized_at TEXT');
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS organize_moves (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL, sha256 TEXT NOT NULL,
+        from_path TEXT NOT NULL, to_path TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+        reason TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_organize_moves_job ON organize_moves(job_id);
+      CREATE INDEX IF NOT EXISTS idx_organize_moves_to ON organize_moves(to_path);
+    `);
+
+    // Selection jobs (PROCESS_SELECTION — docs/archive/ORGANIZER.md
+    // "Selections"): a job may carry an explicit file/folder item list
+    // instead of (or in addition to labeling) a single `selected_relative_path`.
+    // Guarded ALTER so migrate() stays idempotent on an existing DB.
+    const collectionJobColumns = this.db.prepare("PRAGMA table_info(collection_jobs)").all() as Array<{ name: string }>;
+    if (!collectionJobColumns.some(c => c.name === 'selection_json')) {
+      this.db.exec('ALTER TABLE collection_jobs ADD COLUMN selection_json TEXT');
+      this.db.exec('ALTER TABLE collection_jobs ADD COLUMN collection_id TEXT');
+    }
+
+    // Media-only hashing (CANCEL_JOB + media-only workstream,
+    // docs/plans/ARCHIVE-NAS-STAGING-MASTER-PLAN-2026-09-20.md): persisted so
+    // a resumed PAUSED/FAILED job re-applies the same discovery filter it
+    // started with. Guarded ALTER so migrate() stays idempotent.
+    if (!collectionJobColumns.some(c => c.name === 'media_only')) {
+      this.db.exec('ALTER TABLE collection_jobs ADD COLUMN media_only INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   close() { this.db.close(); }
@@ -103,14 +142,27 @@ export class ArchiveDatabase {
 
   insertJob(j: CollectionJobRecord) {
     this.db.prepare(`INSERT INTO collection_jobs
-      (id,source_id,selected_relative_path,state,created_at,updated_at,discovered,hashed,duplicates,failed)
-      VALUES (@id,@sourceId,@selectedRelativePath,@state,@createdAt,@updatedAt,@discovered,@hashed,@duplicates,@failed)`)
-      .run({...j,...j.counters});
+      (id,source_id,selected_relative_path,state,created_at,updated_at,discovered,hashed,duplicates,failed,selection_json,collection_id,media_only)
+      VALUES (@id,@sourceId,@selectedRelativePath,@state,@createdAt,@updatedAt,@discovered,@hashed,@duplicates,@failed,@selectionJson,@collectionId,@mediaOnly)`)
+      .run({
+        id: j.id, sourceId: j.sourceId, selectedRelativePath: j.selectedRelativePath, state: j.state,
+        createdAt: j.createdAt, updatedAt: j.updatedAt,
+        discovered: j.counters.discovered, hashed: j.counters.hashed, duplicates: j.counters.duplicates, failed: j.counters.failed,
+        selectionJson: j.selection ? JSON.stringify(j.selection) : null,
+        collectionId: j.collectionId ?? null,
+        mediaOnly: j.mediaOnly ? 1 : 0,
+      });
   }
 
   getJob(id:string):CollectionJobRecord|undefined {
     const r:any=this.db.prepare('SELECT * FROM collection_jobs WHERE id=?').get(id); if(!r)return;
-    return {id:r.id,sourceId:r.source_id,selectedRelativePath:r.selected_relative_path,state:r.state,createdAt:r.created_at,updatedAt:r.updated_at,counters:{discovered:r.discovered,hashed:r.hashed,duplicates:r.duplicates,failed:r.failed}};
+    return {
+      id:r.id,sourceId:r.source_id,selectedRelativePath:r.selected_relative_path,state:r.state,createdAt:r.created_at,updatedAt:r.updated_at,
+      counters:{discovered:r.discovered,hashed:r.hashed,duplicates:r.duplicates,failed:r.failed},
+      ...(r.selection_json ? { selection: JSON.parse(r.selection_json) } : {}),
+      ...(r.collection_id ? { collectionId: r.collection_id } : {}),
+      ...(r.media_only ? { mediaOnly: true } : {}),
+    };
   }
 
   setJobState(id:string,state:CollectionJobRecord['state']) {
@@ -123,7 +175,54 @@ export class ArchiveDatabase {
 
   getLocation(id:string):FileLocationRecord|undefined {
     const r:any=this.db.prepare('SELECT * FROM file_locations WHERE id=?').get(id); if(!r)return;
-    return {id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined};
+    return {id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined,organizedPath:r.organized_path||undefined,organizedAt:r.organized_at||undefined};
+  }
+
+  /** Look up a location by its stable identity (source + the original
+   * discovery relative path, which never changes once organized — only
+   * `organized_path`/`organized_at` move). Used by the organizer, which has
+   * no reason to know the internal `locationId` hash scheme. */
+  getLocationByRelativePath(sourceId:string, relativePath:string):FileLocationRecord|undefined {
+    const r:any=this.db.prepare('SELECT * FROM file_locations WHERE source_id=? AND relative_path=?').get(sourceId, relativePath); if(!r)return;
+    return {id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined,organizedPath:r.organized_path||undefined,organizedAt:r.organized_at||undefined};
+  }
+
+  /** Every location (across sources) that currently resolves to one content
+   * asset. The organizer uses it to decide whether a DUPLICATE location in
+   * the selected folder is the copy to organize (canonical lives elsewhere)
+   * or a true in-folder duplicate. */
+  listLocationsForAsset(contentAssetId:string):FileLocationRecord[] {
+    const rows:any[]=this.db.prepare('SELECT * FROM file_locations WHERE content_asset_id=? ORDER BY discovered_at').all(contentAssetId);
+    return rows.map(r=>({id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined,organizedPath:r.organized_path||undefined,organizedAt:r.organized_at||undefined}));
+  }
+
+  /** Set/clear where this location's bytes currently sit inside
+   * `HITLOOP-ARCHIVE/…`. Pass nulls to undo (restored to its original
+   * `relativePath`, which is never itself rewritten). */
+  setLocationOrganized(id:string, organizedPath:string|null, organizedAt:string|null) {
+    this.db.prepare('UPDATE file_locations SET organized_path=?, organized_at=? WHERE id=?').run(organizedPath, organizedAt, id);
+  }
+
+  insertOrganizeMove(x:{id:string;jobId:string;sha256:string;fromPath:string;toPath:string;sizeBytes:number;reason:'organize'|'undo';createdAt:string}) {
+    this.db.prepare(`INSERT INTO organize_moves (id,job_id,sha256,from_path,to_path,size_bytes,reason,created_at)
+      VALUES (@id,@jobId,@sha256,@fromPath,@toPath,@sizeBytes,@reason,@createdAt)`).run(x);
+  }
+
+  listOrganizeMoves(jobId:string):Array<{id:string;jobId:string;sha256:string;fromPath:string;toPath:string;sizeBytes:number;reason:'organize'|'undo';createdAt:string}> {
+    const rows:any[]=this.db.prepare('SELECT * FROM organize_moves WHERE job_id=? ORDER BY created_at ASC, rowid ASC').all(jobId);
+    return rows.map(r=>({id:r.id,jobId:r.job_id,sha256:r.sha256,fromPath:r.from_path,toPath:r.to_path,sizeBytes:r.size_bytes,reason:r.reason,createdAt:r.created_at}));
+  }
+
+  /** For `UNDO_ORGANIZE { sourceId, relativePath }` (no explicit jobId): the
+   * most recent organize-apply job that moved anything into this
+   * collectionId. 'HITLOOP-ARCHIVE' must match `organize/scheme.ts`'s
+   * ORGANIZED_ROOT_NAME — duplicated as a literal here (not imported) so
+   * database.ts never depends on worker.ts/organize/* (worker.ts already
+   * depends on database.ts; importing back would cycle). */
+  findLatestOrganizeJobIdForCollection(collectionId:string):string|undefined {
+    const like = `HITLOOP-ARCHIVE/${collectionId}/%`;
+    const row = this.db.prepare(`SELECT job_id FROM organize_moves WHERE to_path LIKE ? AND reason='organize' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(like) as {job_id:string}|undefined;
+    return row?.job_id;
   }
 
   upsertLocation(x:FileLocationRecord) {
@@ -172,7 +271,7 @@ export class ArchiveDatabase {
 
   listAssetLocations(contentAssetId:string):FileLocationRecord[] {
     const rows:any[]=this.db.prepare('SELECT * FROM file_locations WHERE content_asset_id=? ORDER BY relative_path').all(contentAssetId);
-    return rows.map(r=>({id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined}));
+    return rows.map(r=>({id:r.id,sourceId:r.source_id,relativePath:r.relative_path,sizeBytes:r.size_bytes,modifiedAtMs:r.modified_at_ms,discoveredAt:r.discovered_at,lastSeenAt:r.last_seen_at,state:r.state,contentAssetId:r.content_asset_id||undefined,error:r.error||undefined,organizedPath:r.organized_path||undefined,organizedAt:r.organized_at||undefined}));
   }
 
   setAssetState(id:string,state:ContentAssetRecord['state']) {

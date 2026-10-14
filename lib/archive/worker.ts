@@ -3,7 +3,14 @@ import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { sha256File } from './hash';
 import { ArchiveDatabase } from './database';
-import type { ArchiveSource, CollectionJobRecord, FileLocationRecord } from './types';
+import type { ArchiveSource, CollectionJobRecord, FileLocationRecord, SelectionItem } from './types';
+import { isFilesystemArtifact, isMovableExtension, ORGANIZED_ROOT_NAME } from './organize/scheme';
+
+// Re-exported for existing callers (`daemon.ts`) — canonical definitions now
+// live in `organize/scheme.ts` so the organizer's pure module has no
+// dependency on the worker, and the worker's discovery walk agrees with the
+// organizer about what "real" content is and where its own output tree lives.
+export { isFilesystemArtifact, ORGANIZED_ROOT_NAME };
 
 const SKIP = new Set(['.git', 'node_modules', '.moleboard']);
 
@@ -11,25 +18,50 @@ function locationId(sourceId: string, relativePath: string): string {
   return createHash('sha256').update(sourceId + ':' + relativePath).digest('hex');
 }
 
-// macOS resource forks (AppleDouble `._*` companion files) and `.DS_Store` are
-// SMB/Finder artifacts, not archive content. Skipping them at discovery keeps
-// them out of hashing, TwelveLabs, Jev, and the human review queue entirely —
-// a real NAS folder run surfaced six of these sharing one 368-byte asset.
-// Exported so the daemon can also recognize a location hashed before this
-// filter existed (a stale row from an earlier run).
-export function isFilesystemArtifact(name: string): boolean {
-  return name.startsWith('._') || name === '.DS_Store';
-}
-
 async function* walk(root: string, current = root): AsyncGenerator<string> {
   const dir = await fs.opendir(current);
   for await (const entry of dir) {
     if (SKIP.has(entry.name)) continue;
+    if (entry.isDirectory() && entry.name === ORGANIZED_ROOT_NAME) {
+      // Never re-discover the organizer's own output tree as source content,
+      // unless this job's own root is already inside it (a correction
+      // re-file walking within the organized tree itself).
+      const rootIsInsideOrganized = root.split(path.sep).includes(ORGANIZED_ROOT_NAME);
+      if (!rootIsInsideOrganized) continue;
+    }
     const full = path.join(current, entry.name);
     if (entry.isDirectory()) { yield* walk(root, full); continue; }
     if (entry.isFile()) {
       if (isFilesystemArtifact(entry.name)) continue;
       yield full;
+    }
+  }
+}
+
+/**
+ * PROCESS_SELECTION discovery: the union of each `folder` item (walked
+ * recursively with the identical `walk()` rules above — HITLOOP-ARCHIVE
+ * skip, artifact skip) plus each `file` item (yielded directly; existence/
+ * stability is left to the normal per-file try/catch in `run()`, same as
+ * every path `walk()` itself produces). Absolute paths already yielded are
+ * never yielded twice, so a file that sits inside one selected folder and is
+ * ALSO separately selected (or falls under two overlapping selected folders)
+ * is only ever hashed once.
+ */
+async function* selectionWalk(sourceRoot: string, items: SelectionItem[]): AsyncGenerator<string> {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const absolute = path.resolve(sourceRoot, item.relativePath);
+    if (item.kind === 'folder') {
+      for await (const filePath of walk(absolute)) {
+        if (seen.has(filePath)) continue;
+        seen.add(filePath);
+        yield filePath;
+      }
+    } else {
+      if (seen.has(absolute)) continue;
+      seen.add(absolute);
+      yield absolute;
     }
   }
 }
@@ -42,6 +74,12 @@ export interface ArchiveWorkerOptions {
 
 export class ArchiveWorker {
   private pauseRequested = new Set<string>();
+  /** Jobs whose next per-file check (see `run()`) should stop the walk and
+   * mark the job CANCELLED. Set by `cancel()` — safe to call from a
+   * different code path (the daemon's browse lane) than the one whose
+   * `run()`/`resume()` is actually iterating this job, since both share the
+   * same `ArchiveWorker` instance while a command is in flight. */
+  private cancelRequested = new Set<string>();
   private options: Required<Pick<ArchiveWorkerOptions, 'stableFileDwellMs' | 'heartbeatEveryFiles'>> & ArchiveWorkerOptions;
 
   constructor(private store = new ArchiveDatabase(), options: ArchiveWorkerOptions = {}) {
@@ -75,6 +113,27 @@ export class ArchiveWorker {
     this.store.setJobState(jobId, 'PAUSED');
   }
 
+  /** Requests that a currently-running `run()`/`resume()` for this job stop
+   * at its next per-file check point (see `run()`) and mark the job
+   * CANCELLED. Unlike `pause()`, this does NOT set the job state itself —
+   * `run()` does that once it actually observes the flag, so the state
+   * transition happens exactly where the walk actually stopped (and, for the
+   * mid-hash check point, after the in-flight location has been marked
+   * RETRYABLE_FAILED). Safe to call for a job this instance isn't currently
+   * running (e.g. it already finished): the flag is simply never observed
+   * and left for the next `run()`/`resume()` call to pick up. */
+  cancel(jobId: string): void {
+    const job = this.store.getJob(jobId);
+    if (!job) throw new Error('Unknown job');
+    this.cancelRequested.add(jobId);
+  }
+
+  private cancelJob(jobId: string): CollectionJobRecord {
+    this.cancelRequested.delete(jobId);
+    this.store.setJobState(jobId, 'CANCELLED');
+    return this.store.getJob(jobId)!;
+  }
+
   resume(jobId: string): Promise<CollectionJobRecord> {
     const job = this.store.getJob(jobId);
     if (!job) throw new Error('Unknown job');
@@ -93,12 +152,15 @@ export class ArchiveWorker {
     return source;
   }
 
-  createJob(sourceId: string, selectedRelativePath = '.'): CollectionJobRecord {
+  createJob(sourceId: string, selectedRelativePath = '.', opts?: { selection?: SelectionItem[]; collectionId?: string; mediaOnly?: boolean }): CollectionJobRecord {
     const now = new Date().toISOString();
     const job: CollectionJobRecord = {
       id: randomUUID(), sourceId, selectedRelativePath, state: 'QUEUED',
       createdAt: now, updatedAt: now,
-      counters: { discovered: 0, hashed: 0, duplicates: 0, failed: 0 }
+      counters: { discovered: 0, hashed: 0, duplicates: 0, failed: 0 },
+      ...(opts?.selection ? { selection: opts.selection } : {}),
+      ...(opts?.collectionId ? { collectionId: opts.collectionId } : {}),
+      ...(opts?.mediaOnly ? { mediaOnly: true } : {}),
     };
     this.store.insertJob(job);
     return job;
@@ -111,27 +173,64 @@ export class ArchiveWorker {
     if (!source) throw new Error('Unknown source');
 
     const sourceRoot = path.resolve(source.rootPath);
-    const selectedRoot = path.resolve(sourceRoot, job.selectedRelativePath);
-    const selectedRelative = path.relative(sourceRoot, selectedRoot);
-    if (selectedRelative.startsWith('..') || path.isAbsolute(selectedRelative)) {
-      throw new Error('Selected path escapes source root');
+    const isSelectionJob = Boolean(job.selection && job.selection.length);
+
+    // Single-folder jobs (PROCESS_COLLECTION) keep the exact prior validation
+    // and existence-check target (`selectedRoot`). Selection jobs (
+    // PROCESS_SELECTION) have no single root to resolve — every item is
+    // validated individually instead. The daemon already validates a
+    // PROCESS_SELECTION command's items before creating the job; this is a
+    // defense-in-depth re-check, same relationship PROCESS_COLLECTION has
+    // between daemon.ts and this escape check.
+    let selectedRoot = sourceRoot;
+    if (isSelectionJob) {
+      for (const item of job.selection!) {
+        const absolute = path.resolve(sourceRoot, item.relativePath);
+        const relative = path.relative(sourceRoot, absolute);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          throw new Error(`Selected item escapes source root: ${item.relativePath}`);
+        }
+      }
+    } else {
+      selectedRoot = path.resolve(sourceRoot, job.selectedRelativePath);
+      const selectedRelative = path.relative(sourceRoot, selectedRoot);
+      if (selectedRelative.startsWith('..') || path.isAbsolute(selectedRelative)) {
+        throw new Error('Selected path escapes source root');
+      }
     }
 
     this.store.setJobState(jobId, 'RUNNING');
 
+    const rootsReachable = async () => {
+      if (isSelectionJob) {
+        await Promise.all(job.selection!.map(item => fs.access(path.resolve(sourceRoot, item.relativePath))));
+      } else {
+        await fs.access(selectedRoot);
+      }
+    };
+
     try {
-      await fs.access(selectedRoot);
+      await rootsReachable();
     } catch {
       this.store.upsertSource({ ...source, state: 'OFFLINE', lastSeenAt: source.lastSeenAt });
       this.store.setJobState(jobId, 'PAUSED');
       return this.store.getJob(jobId)!;
     }
 
+    const mediaOnly = Boolean(job.mediaOnly);
+    let skippedNonMedia = 0;
     let processedSinceHeartbeat = 0;
     this.heartbeat(jobId, source.id);
     try {
-    for await (const fullPath of walk(selectedRoot)) {
+    for await (const fullPath of (isSelectionJob ? selectionWalk(sourceRoot, job.selection!) : walk(selectedRoot))) {
       if (this.pauseRequested.has(jobId)) return this.store.getJob(jobId)!;
+      if (this.cancelRequested.has(jobId)) return this.cancelJob(jobId);
+      if (mediaOnly && !isMovableExtension(path.basename(fullPath))) {
+        // Never stat'd or hashed, and never counted as discovered/failed —
+        // it simply never existed as far as this job is concerned.
+        skippedNonMedia++;
+        continue;
+      }
       processedSinceHeartbeat++;
       if (processedSinceHeartbeat >= this.options.heartbeatEveryFiles) {
         this.heartbeat(jobId, source.id);
@@ -156,6 +255,15 @@ export class ArchiveWorker {
         };
         this.store.upsertLocation(location);
         this.store.bumpJob(jobId, 'discovered');
+
+        // Cancellation check point #2: this file is now durably marked
+        // HASHING (the "in-flight" location a CANCEL_JOB must not leave
+        // dangling) right before the potentially slow hash itself. Mark it
+        // retryable instead of proceeding.
+        if (this.cancelRequested.has(jobId)) {
+          this.store.upsertLocation({ ...this.store.getLocation(id)!, state: 'RETRYABLE_FAILED', error: 'cancelled' });
+          return this.cancelJob(jobId);
+        }
 
         const hash = await sha256File(fullPath);
         const after = await fs.stat(fullPath);
@@ -218,7 +326,7 @@ export class ArchiveWorker {
     // A disconnected NAS can make traversal end early. Verify source still exists
     // before ever marking the collection complete.
     try {
-      await fs.access(selectedRoot);
+      await rootsReachable();
     } catch {
       this.store.upsertSource({ ...source, state: 'OFFLINE', lastSeenAt: source.lastSeenAt });
       this.store.setJobState(jobId, 'PAUSED');
@@ -227,6 +335,9 @@ export class ArchiveWorker {
 
     this.store.setJobState(jobId, 'COMPLETE');
     this.store.upsertSource({ ...source, state: 'ONLINE', lastSeenAt: new Date().toISOString() });
-    return this.store.getJob(jobId)!;
+    const finished = this.store.getJob(jobId)!;
+    // In-memory only (see CollectionJobRecord.skippedNonMedia) — never
+    // written to SQLite, so a later getJob() for this same id won't carry it.
+    return skippedNonMedia > 0 ? { ...finished, skippedNonMedia } : finished;
   }
 }

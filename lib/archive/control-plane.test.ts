@@ -58,3 +58,57 @@ test('purgeIntake DELETEs the intake route and throws a clear error on failure',
     await assert.rejects(() => client.purgeIntake({ intakeId: 'i1', workerId: 'worker-1' }), /HITLOOP intake purge failed: 409/);
   });
 });
+
+test('pollCommands with no opts sends only workerId, unchanged from before', async () => {
+  const client = new ControlPlaneClient('http://localhost:3000', 'worker-token');
+  const calls: Array<{ url: string }> = [];
+  await withFetch(async (url: any) => {
+    calls.push({ url: String(url) });
+    return fakeResponse(200, { commands: [] });
+  }, () => client.pollCommands('worker-1'));
+
+  assert.equal(calls.length, 1);
+  const url = new URL(calls[0].url);
+  assert.equal(url.searchParams.get('workerId'), 'worker-1');
+  assert.equal(url.searchParams.has('types'), false);
+  assert.equal(url.searchParams.has('excludeTypes'), false);
+});
+
+test('pollCommands with opts.types sends a comma-joined types param', async () => {
+  const client = new ControlPlaneClient('http://localhost:3000', 'worker-token');
+  const calls: Array<{ url: string }> = [];
+  await withFetch(async (url: any) => {
+    calls.push({ url: String(url) });
+    return fakeResponse(200, { commands: [] });
+  }, () => client.pollCommands('worker-1', { types: ['LIST_DIRECTORY'] }));
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.searchParams.get('types'), 'LIST_DIRECTORY');
+  assert.equal(url.searchParams.has('excludeTypes'), false);
+});
+
+test('pollCommands with opts.excludeTypes sends a comma-joined excludeTypes param', async () => {
+  const client = new ControlPlaneClient('http://localhost:3000', 'worker-token');
+  const calls: Array<{ url: string }> = [];
+  await withFetch(async (url: any) => {
+    calls.push({ url: String(url) });
+    return fakeResponse(200, { commands: [] });
+  }, () => client.pollCommands('worker-1', { excludeTypes: ['LIST_DIRECTORY', 'UNDO_ORGANIZE'] }));
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.searchParams.get('excludeTypes'), 'LIST_DIRECTORY,UNDO_ORGANIZE');
+  assert.equal(url.searchParams.has('types'), false);
+});
+
+test('pollCommands with empty opts arrays omits both params', async () => {
+  const client = new ControlPlaneClient('http://localhost:3000', 'worker-token');
+  const calls: Array<{ url: string }> = [];
+  await withFetch(async (url: any) => {
+    calls.push({ url: String(url) });
+    return fakeResponse(200, { commands: [] });
+  }, () => client.pollCommands('worker-1', { types: [], excludeTypes: [] }));
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.searchParams.has('types'), false);
+  assert.equal(url.searchParams.has('excludeTypes'), false);
+});

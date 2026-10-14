@@ -14,7 +14,10 @@ import { JevDecisionService, reviewBand } from './jev/service';
 import { AnthropicJevProvider } from './jev/anthropic-provider';
 import { JEV_QUESTIONS } from './jev/taxonomy';
 import { buildAssetState } from './schema/asset-state';
-import type { ContentAssetRecord } from './types';
+import type { ArchiveSource, CollectionJobRecord, ContentAssetRecord, SelectionItem } from './types';
+import { planOrganizeCollection, type OrganizePlan } from './organize/planner';
+import { applyOrganizePlan, undoOrganizeJob } from './organize/mover';
+import { slugifyCollectionId, isMovableExtension, ORGANIZED_ROOT_NAME } from './organize/scheme';
 import {
   ensureCloudIntakeSource,
   drainIntake,
@@ -25,6 +28,25 @@ import {
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+/** Runs `fn` over `items` with at most `limit` in flight at once, preserving
+ * result order. Used by the LIST_DIRECTORY handler so per-file `fs.stat`
+ * calls in a large folder don't run one-at-a-time (slow) or all at once
+ * (fd-storm on a NAS SMB mount). */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export class ArchiveDaemon {
   private stopped = false;
   readonly workerId: string;
@@ -32,6 +54,13 @@ export class ArchiveDaemon {
    * Identifies which UPLOAD_ASSET_ARWEAVE commands belong to Lane 2. */
   private cloudIntakeSourceId?: string;
   private cloudIntakeRootPath?: string;
+
+  /** The PROCESS_COLLECTION/PROCESS_SELECTION job currently executing in the
+   * main lane, if any — set for the duration of `worker.run()` in execute()
+   * below, so a CANCEL_JOB command claimed concurrently by the browse lane
+   * (see runBrowseLane) can find and cancel it. Only ever one at a time: the
+   * main lane awaits each command fully before claiming the next. */
+  private activeJob?: { jobId: string; commandId: string; worker: ArchiveWorker };
 
   constructor(
     private db = new ArchiveDatabase(),
@@ -47,15 +76,30 @@ export class ArchiveDaemon {
 
   stop() { this.stopped = true; }
 
-  /** Unique content-asset ids discovered under a job's selected folder. Shared
-   * by the post-hash analysis step and the HITLOOP sync so both walk the same
-   * scope the same way. */
+  /** Unique content-asset ids discovered under a job's scope. Shared by the
+   * post-hash analysis step and the HITLOOP sync so both walk the same scope
+   * the same way. A PROCESS_SELECTION job (`job.selection` present) scopes to
+   * the union of its file/folder items instead of a single
+   * `selectedRelativePath` prefix. */
   private jobAssetIds(sourceId:string,jobId:string):string[] {
     const job=this.db.getJob(jobId); if(!job) return [];
-    const prefix=job.selectedRelativePath==='.'?'':job.selectedRelativePath.replace(/\/$/,'')+'/';
     const seen=new Set<string>();
-    for(const row of this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path LIKE ?').all(sourceId,`${prefix}%`) as Array<{content_asset_id:string}>){
-      seen.add(row.content_asset_id);
+    const addByPrefix=(prefix:string)=>{
+      for(const row of this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path LIKE ?').all(sourceId,`${prefix}%`) as Array<{content_asset_id:string}>){
+        seen.add(row.content_asset_id);
+      }
+    };
+    if(job.selection && job.selection.length) {
+      for(const item of job.selection) {
+        if(item.kind==='folder') {
+          addByPrefix(item.relativePath==='.'?'':item.relativePath.replace(/\/$/,'')+'/');
+        } else {
+          const row=this.db.db.prepare('SELECT content_asset_id FROM file_locations WHERE source_id=? AND content_asset_id IS NOT NULL AND relative_path=?').get(sourceId,item.relativePath) as {content_asset_id:string}|undefined;
+          if(row) seen.add(row.content_asset_id);
+        }
+      }
+    } else {
+      addByPrefix(job.selectedRelativePath==='.'?'':job.selectedRelativePath.replace(/\/$/,'')+'/');
     }
     return Array.from(seen);
   }
@@ -139,13 +183,13 @@ export class ArchiveDaemon {
   /** Push one asset's current observations/decisions to HITLOOP. Shared by the
    * per-job sync (scoped to that job's file locations) and the background
    * sweep (which syncs an asset outside any specific job). */
-  private async pushAssetSync(sourceId:string,collectionJobId:string|undefined,assetId:string) {
+  private async pushAssetSync(sourceId:string,collectionJobId:string|undefined,assetId:string,organized?:{path:string;appliedAt:string}) {
     const asset=this.db.getAsset(assetId); if(!asset) return;
     const locations=this.db.listAssetLocations(asset.id).filter(x=>x.sourceId===sourceId);
     const observations=this.db.listObservations(asset.id);
     const decisions=this.db.listJevDecisions(asset.id).map(d=>({...d,reviewBand:reviewBand(d.confidence??0)}));
     const mediaType=locations[0]?inferMediaType(locations[0].relativePath):undefined;
-    try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state}});}catch{/* durable local data remains authoritative; retry on later sync */}
+    try{await this.control.syncAsset({workerId:this.workerId,sourceId,collectionJobId,asset:{id:asset.id,sha256:asset.sha256,mediaType,sizeBytes:asset.sizeBytes,sourcePaths:locations.map(x=>x.relativePath),observations,decisions,state:asset.state,...(organized?{organized}:{})}});}catch{/* durable local data remains authoritative; retry on later sync */}
   }
 
   private async syncJobAssets(sourceId:string,jobId:string) {
@@ -252,11 +296,101 @@ export class ArchiveDaemon {
     }
   }
 
+  /** `PROCESS_SELECTION`/`ORGANIZE_COLLECTION{items}` collectionId contract:
+   * lowercase-kebab, 1-64 chars — the same shape `slugifyCollectionId` itself
+   * produces for a single-folder job, so a HITLOOP-picker collectionId and a
+   * derived-from-path one are always interchangeable. */
+  private isValidCollectionId(value: unknown): value is string {
+    return typeof value === 'string' && /^[a-z0-9-]{1,64}$/.test(value);
+  }
+
+  /** Validates a `PROCESS_SELECTION`/`ORGANIZE_COLLECTION{items}` item list
+   * against the registered source: at most 500 items, each with a
+   * `relativePath`/`kind`, resolving inside the source (no `..`/absolute
+   * escape) and never inside the organizer's own reserved
+   * `HITLOOP-ARCHIVE/` output tree. Throws on the first violation — same
+   * convention as every other early-validation throw in `execute()` (e.g.
+   * "Unknown source"): the run()-loop wrapper turns it into a FAILED command,
+   * a direct `execute()` call (tests) rejects. */
+  private validateSelectionItems(source: ArchiveSource, items: SelectionItem[] | undefined): SelectionItem[] {
+    if (!Array.isArray(items) || !items.length) throw new Error('At least one selection item is required');
+    if (items.length > 500) throw new Error('At most 500 selection items are allowed');
+    const root = path.resolve(source.rootPath);
+    for (const item of items) {
+      if (!item || typeof item.relativePath !== 'string' || !item.relativePath) {
+        throw new Error('Every selection item requires a relativePath');
+      }
+      if (item.kind !== 'file' && item.kind !== 'folder') {
+        throw new Error(`Selection item has an invalid kind: ${item.relativePath}`);
+      }
+      const absolute = path.resolve(root, item.relativePath);
+      const relative = path.relative(root, absolute);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) {
+        throw new Error(`Selection item escapes source root: ${item.relativePath}`);
+      }
+      if (relative === ORGANIZED_ROOT_NAME || relative.startsWith(`${ORGANIZED_ROOT_NAME}${path.sep}`)) {
+        throw new Error(`Selection item is inside ${ORGANIZED_ROOT_NAME}: ${item.relativePath}`);
+      }
+    }
+    return items;
+  }
+
+  /** CANCEL_JOB (browse lane only — see runBrowseLane): stops whatever
+   * PROCESS_COLLECTION/PROCESS_SELECTION job is currently running in the main
+   * lane. Matches the active job by `jobId`/`targetCommandId` when given,
+   * otherwise cancels whatever is active. `ArchiveWorker.cancel()` only sets
+   * a flag — the actual walk stops (and the job's own state flips to
+   * CANCELLED) the next time `run()` checks it, which is what eventually
+   * makes the main lane PATCH the original process command to FAILED (see
+   * the CANCELLED branches in the PROCESS_SELECTION/default execute() paths
+   * below). When nothing is active (or the active job doesn't match the
+   * requested target), falls back to failing a still-QUEUED process command
+   * directly by id, so it never gets claimed at all. Never touches the
+   * filesystem itself. */
+  private async executeCancelJob(command: ArchiveCommand) {
+    const targetJobId = command.jobId;
+    const targetCommandId = command.targetCommandId;
+    const active = this.activeJob;
+    const matchesActive = Boolean(active)
+      && (!targetJobId || targetJobId === active!.jobId)
+      && (!targetCommandId || targetCommandId === active!.commandId);
+
+    if (matchesActive) {
+      active!.worker.cancel(active!.jobId);
+      const job = this.db.getJob(active!.jobId);
+      await this.control.updateCommand({
+        commandId: command.id, state: 'COMPLETE',
+        result: { cancelled: true, jobId: active!.jobId, hashedSoFar: job?.counters.hashed ?? 0 },
+      });
+      return;
+    }
+
+    if (targetCommandId) {
+      try {
+        await this.control.updateCommand({ commandId: targetCommandId, state: 'FAILED', error: 'CANCELLED' });
+        await this.control.updateCommand({
+          commandId: command.id, state: 'COMPLETE',
+          result: { cancelled: true, jobId: targetJobId || null, hashedSoFar: 0 },
+        });
+      } catch (error) {
+        await this.control.updateCommand({ commandId: command.id, state: 'FAILED', error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
+
+    await this.control.updateCommand({ commandId: command.id, state: 'FAILED', error: 'No active or queued job to cancel' });
+  }
+
   private async execute(command: ArchiveCommand) {
     await this.control.updateCommand({ commandId: command.id, state: 'CLAIMED' });
 
     if (command.type === 'UPLOAD_JSON') {
       await this.executeUploadJson(command);
+      return;
+    }
+
+    if (command.type === 'CANCEL_JOB') {
+      await this.executeCancelJob(command);
       return;
     }
 
@@ -294,9 +428,144 @@ export class ArchiveDaemon {
       const target = path.resolve(root, command.relativePath || '.');
       const relative = path.relative(root, target);
       if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Directory escapes registered source');
-      const entries = await fs.readdir(target, { withFileTypes:true });
-      const folders = entries.filter(e=>e.isDirectory() && !e.name.startsWith('.')).map(e=>e.name).sort((a,b)=>a.localeCompare(b));
-      await this.control.updateCommand({ commandId:command.id, state:'COMPLETE', result:{relativePath:relative || '.', folders} });
+      const dirents = await fs.readdir(target, { withFileTypes:true });
+      const visible = dirents.filter(e => !e.name.startsWith('.') && !isFilesystemArtifact(e.name));
+      const folderDirents = visible.filter(e=>e.isDirectory()).sort((a,b)=>a.name.localeCompare(b.name));
+      const fileDirents = visible.filter(e=>e.isFile()).sort((a,b)=>a.name.localeCompare(b.name));
+
+      // Kept byte-for-byte compatible with the pre-Phase-1 result shape —
+      // existing callers reading `result.folders` see no change.
+      const folders = folderDirents.map(e=>e.name);
+      const folderEntries = folderDirents.map(e=>({ name:e.name, kind:'folder' as const }));
+
+      // Dirent carries no size/mtime; stat each file with bounded concurrency
+      // so a folder with thousands of files doesn't serialize (slow) or storm
+      // the NAS's SMB mount (all at once). A stat failure (race, permission,
+      // dangling symlink) still yields an entry — just without size/modifiedAt.
+      const fileEntries = await mapWithConcurrency(fileDirents, 16, async e => {
+        const extension = path.extname(e.name).slice(1).toLowerCase();
+        const entry: { name:string; kind:'file'; sizeBytes?:number; modifiedAt?:string; ext?:string; movable:boolean } = {
+          name: e.name, kind: 'file', movable: isMovableExtension(e.name),
+        };
+        if (extension) entry.ext = extension;
+        try {
+          const stat = await fs.stat(path.join(target, e.name));
+          entry.sizeBytes = stat.size;
+          entry.modifiedAt = stat.mtime.toISOString();
+        } catch { /* still include the entry without size/mtime */ }
+        return entry;
+      });
+
+      const dirEntries = [...folderEntries, ...fileEntries];
+      await this.control.updateCommand({
+        commandId:command.id, state:'COMPLETE',
+        result:{ relativePath:relative || '.', folders, entries:dirEntries, counts:{ folders: folderEntries.length, files: fileEntries.length } },
+      });
+      return;
+    }
+
+    if (command.type === 'PROCESS_SELECTION') {
+      if (!this.isValidCollectionId(command.collectionId)) {
+        throw new Error('PROCESS_SELECTION requires a valid collectionId (lowercase-kebab, 1-64 chars)');
+      }
+      const items = this.validateSelectionItems(source, command.items);
+
+      // Identical path to PROCESS_COLLECTION below (worker run ->
+      // runAnalysisAndJev -> syncJobAssets -> heartbeats/COMPLETE|FAILED) —
+      // only how the job is created differs (an explicit item selection
+      // instead of a single selectedRelativePath).
+      const worker = new ArchiveWorker(this.db, {
+        onHeartbeat: async h => {
+          const job = this.db.getJob(h.jobId);
+          try {
+            await this.control.heartbeat({
+              workerId: this.workerId, sourceId, jobId: h.jobId,
+              state: 'PROCESSING', at: h.at, counters: job?.counters,
+            });
+          } catch { /* processing must survive control-plane telemetry failure */ }
+        },
+      });
+      const job = worker.createJob(sourceId, '.', { selection: items, collectionId: command.collectionId, mediaOnly: command.mediaOnly });
+      await this.control.updateCommand({ commandId: command.id, state: 'RUNNING', jobId: job.id });
+      this.activeJob = { jobId: job.id, commandId: command.id, worker };
+      let result: CollectionJobRecord;
+      try {
+        result = await worker.run(job.id);
+      } finally {
+        this.activeJob = undefined;
+      }
+      if (result.state === 'CANCELLED') {
+        await this.control.updateCommand({ commandId: command.id, state: 'FAILED', jobId: job.id, error: `CANCELLED by owner (kept ${result.counters.hashed} hashed files)` });
+        return;
+      }
+      await this.runAnalysisAndJev(sourceId, job.id);
+      await this.syncJobAssets(sourceId, job.id);
+      const state = result.state === 'COMPLETE' ? 'COMPLETE' : 'FAILED';
+      await this.control.updateCommand({
+        commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null,
+        ...(state === 'COMPLETE' && result.skippedNonMedia ? { result: { skippedNonMedia: result.skippedNonMedia } } : {}),
+      });
+      return;
+    }
+
+    if (command.type === 'ORGANIZE_COLLECTION') {
+      const hasItems = Boolean(command.items && command.items.length);
+      let plan: OrganizePlan;
+      if (hasItems) {
+        if (!this.isValidCollectionId(command.collectionId)) {
+          throw new Error('ORGANIZE_COLLECTION with items requires a valid collectionId (lowercase-kebab, 1-64 chars)');
+        }
+        const items = this.validateSelectionItems(source, command.items);
+        plan = await planOrganizeCollection({ db:this.db, source, items, collectionId: command.collectionId! });
+      } else {
+        const selectedRelativePath = command.relativePath || '.';
+        plan = await planOrganizeCollection({ db:this.db, source, selectedRelativePath });
+      }
+
+      if (command.mode !== 'apply') {
+        // plan writes nothing to disk or SQLite; just hands the move/skip
+        // list back for /archive to render before anyone clicks APPLY.
+        await this.control.updateCommand({ commandId:command.id, state:'COMPLETE', result:{ mode:'plan', plan } });
+        return;
+      }
+
+      await this.control.updateCommand({ commandId:command.id, state:'RUNNING' });
+      // This command's own id is the "job" every moved file's journal line
+      // and organize_moves row is tagged with — what UNDO_ORGANIZE replays.
+      const applied = await applyOrganizePlan({ db:this.db, source, jobId:command.id, plan });
+
+      for (const move of applied.moved) {
+        const asset = this.db.findAssetByHash(move.sha256);
+        if (!asset) continue;
+        try { await this.pushAssetSync(sourceId, undefined, asset.id, { path: move.to, appliedAt: new Date().toISOString() }); }
+        catch { /* best-effort; local SQLite (organized_path/organized_at) remains authoritative */ }
+      }
+
+      const state = applied.failedAt ? 'FAILED' : 'COMPLETE';
+      await this.control.updateCommand({
+        commandId:command.id, state,
+        error: applied.failedAt ? applied.failedAt.error : null,
+        result: { mode:'apply', jobId:command.id, root:plan.root, collectionId:plan.collectionId, moved:applied.moved, skipped:plan.skipped, counts:plan.counts, failedAt: applied.failedAt || null },
+      });
+      return;
+    }
+
+    if (command.type === 'UNDO_ORGANIZE') {
+      // An explicit collectionId (a selection's collection, or any collection
+      // the caller already knows the id of) wins; otherwise fall back to the
+      // pre-existing relativePath -> slug derivation.
+      const collectionId = command.collectionId || slugifyCollectionId(command.relativePath || '.');
+      const jobId = command.organizeJobId || this.db.findLatestOrganizeJobIdForCollection(collectionId);
+      if (!jobId) throw new Error('No organize job found to undo for this collection');
+
+      await this.control.updateCommand({ commandId:command.id, state:'RUNNING' });
+      const undone = await undoOrganizeJob({ db:this.db, source, jobId });
+      const state = undone.errors.length ? 'FAILED' : 'COMPLETE';
+      await this.control.updateCommand({
+        commandId:command.id, state,
+        error: undone.errors.length ? undone.errors[0].error : null,
+        result: { jobId: undone.jobId, restored: undone.restored, errors: undone.errors },
+      });
       return;
     }
 
@@ -311,16 +580,54 @@ export class ArchiveDaemon {
         } catch { /* processing must survive control-plane telemetry failure */ }
       },
     });
-    const job = worker.createJob(sourceId, command.relativePath);
+    const job = worker.createJob(sourceId, command.relativePath, { mediaOnly: command.mediaOnly });
     await this.control.updateCommand({ commandId: command.id, state: 'RUNNING', jobId: job.id });
-    const result = await worker.run(job.id);
+    this.activeJob = { jobId: job.id, commandId: command.id, worker };
+    let result: CollectionJobRecord;
+    try {
+      result = await worker.run(job.id);
+    } finally {
+      this.activeJob = undefined;
+    }
+    if (result.state === 'CANCELLED') {
+      await this.control.updateCommand({ commandId: command.id, state: 'FAILED', jobId: job.id, error: `CANCELLED by owner (kept ${result.counters.hashed} hashed files)` });
+      return;
+    }
     await this.runAnalysisAndJev(sourceId,job.id);
     await this.syncJobAssets(sourceId,job.id);
     const state = result.state === 'COMPLETE' ? 'COMPLETE' : 'FAILED';
-    await this.control.updateCommand({ commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null });
+    await this.control.updateCommand({
+      commandId: command.id, state, jobId: job.id, error: state === 'FAILED' ? 'Collection did not complete' : null,
+      ...(state === 'COMPLETE' && result.skippedNonMedia ? { result: { skippedNonMedia: result.skippedNonMedia } } : {}),
+    });
   }
 
-  async run(pollMs = 5000) {
+  /** Phase 1 fast lane: a second, independent poll loop scoped to
+   * LIST_DIRECTORY and CANCEL_JOB, so a cheap readdir (or a cancel request)
+   * never waits behind a slow PROCESS_COLLECTION/analysis pass running in the
+   * main loop — CANCEL_JOB in particular must be able to reach the daemon
+   * WHILE the main lane is busy inside worker.run(), which is the whole
+   * point of it living here. Started (unwaited) from run() and stopped by
+   * the same `stopped` flag. Errors (a bad command, or HITLOOP being briefly
+   * unreachable) never stop this loop or the main one. At most one command
+   * executes at a time in this lane: the for-of below awaits each command
+   * before claiming more. */
+  private async runBrowseLane(pollMs = 1000) {
+    while (!this.stopped) {
+      try {
+        const commands = await this.control.pollCommands(this.workerId, { types: ['LIST_DIRECTORY', 'CANCEL_JOB'] });
+        for (const command of commands) {
+          try { await this.execute(command); }
+          catch (error) {
+            await this.control.updateCommand({ commandId: command.id, state: 'FAILED', error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      } catch { /* the browse lane must survive a transient HITLOOP outage same as the main loop */ }
+      await sleep(pollMs);
+    }
+  }
+
+  async run(pollMs = 5000, browsePollMs = 1000) {
     // Lane 2 cloud intake: register the local scratch source once at start (D1 —
     // never under /Volumes or any NAS mount). Non-fatal: a failure here just
     // means drainCloudIntake stays a no-op until the next restart.
@@ -363,6 +670,12 @@ export class ArchiveDaemon {
       }
     };
     await idleHeartbeat();
+
+    // Start the browse lane concurrently with the main loop below; both are
+    // gated by the same `stopped` flag, and run() only resolves once both
+    // have exited (see the await at the bottom of this method).
+    const browseLanePromise = this.runBrowseLane(browsePollMs);
+
     let pollsSinceHeartbeat = 0;
     let pollsSinceSweep = 0;
     // Offset from pollsSinceSweep's own 6-poll cadence (starts at 3, not 0) so
@@ -381,7 +694,9 @@ export class ArchiveDaemon {
         try { await this.drainCloudIntake(); } catch { /* a drain failure must not stop the poll loop */ }
       }
       try {
-        const commands = await this.control.pollCommands(this.workerId);
+        // excludeTypes keeps LIST_DIRECTORY/CANCEL_JOB exclusively on the
+        // browse lane above so the two lanes never claim the same command.
+        const commands = await this.control.pollCommands(this.workerId, { excludeTypes: ['LIST_DIRECTORY', 'CANCEL_JOB'] });
         for (const command of commands) {
           try { await this.execute(command); }
           catch (error) {
@@ -391,6 +706,7 @@ export class ArchiveDaemon {
       } catch { /* NAS work remains independent if HITLOOP is temporarily unreachable */ }
       await sleep(pollMs);
     }
+    await browseLanePromise;
   }
 }
 
