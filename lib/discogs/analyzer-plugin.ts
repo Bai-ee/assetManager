@@ -12,8 +12,12 @@ import { DiscogsClient } from './client';
 import { DEFAULT_INDEX_PATH } from './media';
 import { planFolder, estimateFolder, applyPlan, undoApply } from './run';
 import type { ProgressInfo, RunDeps } from './run';
+import { processFolder, type ProcessDeps, type ProcessOnly } from './process';
+import { hitloop, publishPaths } from './publish-run';
 
-export const DISCOGS_COMMAND_TYPES = ['DISCOGS_PLAN', 'DISCOGS_APPLY', 'DISCOGS_UNDO'];
+export const DISCOGS_COMMAND_TYPES = ['DISCOGS_PLAN', 'DISCOGS_APPLY', 'DISCOGS_UNDO', 'DISCOGS_PROCESS'];
+const MAX_ONLY_ITEMS = 50;
+const MAX_RENDER = 50;
 const DEFAULT_DISCOGS_DIR = '/Volumes/bryan/MacTransfer/discogs';
 const IDENTITY_TTL_MS = 10 * 60_000;
 const PROGRESS_MIN_INTERVAL_MS = 1000;
@@ -30,6 +34,8 @@ export interface DiscogsPluginOptions {
   makeClient?: () => DiscogsClient;
   /** Overrides for the run deps (tests inject fake readers/scanners). */
   runDeps?: Partial<RunDeps>;
+  /** Overrides for DISCOGS_PROCESS (tests inject publishRecord / thumb / hitloop). */
+  processDeps?: Partial<ProcessDeps>;
   now?: () => number;
 }
 
@@ -119,6 +125,33 @@ export function discogsPlugin(opts: DiscogsPluginOptions = {}): AnalyzerPlugin {
     if (cmd.type === 'DISCOGS_UNDO') {
       const r = await undoApply({ journal: String(cmd.journal ?? '') }, deps);
       return { result: r, cancelled: r.cancelled === true };
+    }
+    // Process drive: plan -> add -> render + draft confident single-clip records -> review list. `only` = operator
+    // resolutions from the review list (pinned release + clip). HITLOOP creds come from the daemon's own env.
+    if (cmd.type === 'DISCOGS_PROCESS') {
+      const sourceId = String(cmd.sourceId ?? '');
+      const relativePath = typeof cmd.relativePath === 'string' ? cmd.relativePath : '';
+      const dir = resolveFolder(ctx.getSource(sourceId), relativePath);
+      const capUsd = capFrom(cmd.capUsd);
+      const publish = cmd.publish !== false;
+      let only: ProcessOnly[] | undefined;
+      if (cmd.only != null) {
+        if (!Array.isArray(cmd.only) || !cmd.only.length || cmd.only.length > MAX_ONLY_ITEMS) throw new BadRequest(`only must list 1 to ${MAX_ONLY_ITEMS} records`);
+        only = cmd.only.map(i => {
+          const it = i as { groupId?: unknown; releaseId?: unknown; video?: unknown };
+          if (typeof it?.groupId !== 'string' || !Number.isInteger(it.releaseId) || (it.releaseId as number) <= 0) throw new BadRequest('Each item needs groupId and a positive releaseId');
+          if (it.video != null && (typeof it.video !== 'string' || it.video !== it.video.split(/[\\/]/).pop())) throw new BadRequest('video must be a file name');
+          return { groupId: it.groupId, releaseId: it.releaseId as number, video: typeof it.video === 'string' ? it.video : undefined };
+        });
+      }
+      const paths = opts.home ? publishPaths(home) : publishPaths();
+      let h: ReturnType<typeof hitloop> | null = null;
+      if (publish && opts.processDeps?.hitloop === undefined) h = hitloop(env);
+      const r = await processFolder(
+        { dir, capUsd, maxRender: intIn(cmd.maxRender, 1, MAX_RENDER, MAX_RENDER, 'maxRender'), only, publish },
+        { ...deps, paths, hitloop: opts.processDeps?.hitloop === undefined ? h : opts.processDeps.hitloop, log: line => console.log(line), ...opts.processDeps },
+      );
+      return { result: { sourceId, relativePath, ...r }, cancelled: r.cancelled };
     }
     throw new Error(`Unsupported command type ${cmd.type}`);
   }

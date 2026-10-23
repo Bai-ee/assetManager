@@ -50,7 +50,7 @@ function make(opts: { cancelled?: boolean; env?: Record<string, string | undefin
 
 test('plugin declares its command types and route prefix', () => {
   const { plugin } = make();
-  assert.deepEqual(plugin.commandTypes, ['DISCOGS_PLAN', 'DISCOGS_APPLY', 'DISCOGS_UNDO']);
+  assert.deepEqual(plugin.commandTypes, ['DISCOGS_PLAN', 'DISCOGS_APPLY', 'DISCOGS_UNDO', 'DISCOGS_PROCESS']);
   assert.deepEqual(DISCOGS_COMMAND_TYPES, plugin.commandTypes);
   assert.equal(plugin.routePrefix, '/discogs/');
 });

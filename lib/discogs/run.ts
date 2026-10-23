@@ -23,7 +23,7 @@ const FALLBACK_READ_USD = 0.01;
 export const JOURNAL_NAME = /^[\w.-]+-applied[\w.-]*\.jsonl$/;
 const PLAN_ID = /^[\w.-]+$/;
 
-export interface ProgressInfo { phase: 'scanning' | 'reading' | 'matching' | 'adding' | 'removing'; done: number; total: number; spentUsd: number }
+export interface ProgressInfo { phase: 'scanning' | 'reading' | 'matching' | 'adding' | 'removing' | 'rendering' | 'thumbnails'; done: number; total: number; spentUsd: number }
 
 export interface RunDeps {
   client: DiscogsClient;
@@ -37,6 +37,8 @@ export interface RunDeps {
   isCancelled?: () => boolean;
   /** Called once after scan + collection fetch, before any label read. */
   onScanned?: (info: { files: number; duplicates: number; groups: number; collection: number }) => void;
+  /** Saved plans to reuse by group id instead of reading + matching again (groups already drafted): same files => same plan. */
+  reuse?: Map<string, GroupPlan>;
   // Injection seams (tests); real implementations by default.
   scan?: typeof scanFolder;
   toJpeg?: (file: MediaFile, cacheDir: string) => Promise<string>;
@@ -171,6 +173,9 @@ async function planGroup(
   return { ...plan, action: 'review', reason: `score ${best.score}${best.reasons.includes('catno exact') ? '' : ', no exact catno'}` };
 }
 
+const fpSet = (g: RecordGroup) => [...g.images, ...g.videos].map(f => f.fingerprint).sort().join(',');
+const sameFiles = (a: RecordGroup, b: RecordGroup) => fpSet(a) === fpSet(b);
+
 export async function planFolder(input: { dir: string; limit?: number }, deps: RunDeps): Promise<PlanResult> {
   mkdirSync(deps.cacheDir, { recursive: true });
   mkdirSync(deps.runsDir, { recursive: true });
@@ -196,6 +201,13 @@ export async function planFolder(input: { dir: string; limit?: number }, deps: R
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
     if (deps.isCancelled?.()) { cancelled = true; break; }
+    const prior = deps.reuse?.get(g.id);
+    if (prior && sameFiles(prior.group, g)) {
+      plans.push({ ...prior, group: g });
+      if (prior.best) claimed.add(prior.best.releaseId);
+      progress('matching', i + 1, groups.length, spent());
+      continue;
+    }
     const jpegs = new Map<string, string>();
     let uncached = 0;
     for (const img of g.images) {

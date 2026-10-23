@@ -22,7 +22,8 @@ const MAX_CLIP_BYTES = 512 * 1024 * 1024;
 const MAX_CLIP_SECONDS = 140;
 const LOOK = DEFAULT_LOOK;
 
-export interface PublishedEntry { releaseId: number; postId: string; packageId: string; at: string; clip: { start: number; end: number; look: string } }
+/** `groupId` (label fingerprint group) is what says "this record is done" when the matcher later picks another pressing id. */
+export interface PublishedEntry { releaseId: number; postId: string; packageId: string; at: string; clip: { start: number; end: number; look: string }; groupId?: string }
 
 export interface PublishPaths { home: string; runs: string; work: string; srcCache: string; cache: string; published: string; usageReported: string; costLog: string }
 
@@ -198,7 +199,7 @@ export async function uploadAndDraft(h: Hitloop, rec: EligibleRecord, p: Prepare
   for (const a of ASPECT_LIST) variants.video[a] = await uploadFile(h, rec.releaseId, 'video', a, p.clipPaths[a]);
   for (const a of ASPECT_LIST) variants.image[a] = await uploadFile(h, rec.releaseId, 'image', a, p.imagePaths[a]);
   const draft = await h.post<DraftResult>('discogs/draft', buildDraftBody(p.facts, variants, xAspect, { files, clip: p.clip }));
-  const entry: PublishedEntry = { releaseId: rec.releaseId, postId: draft.postId, packageId: draft.packageId, at: new Date().toISOString(), clip: p.clip };
+  const entry: PublishedEntry = { releaseId: rec.releaseId, postId: draft.postId, packageId: draft.packageId, at: new Date().toISOString(), clip: p.clip, groupId: rec.group.id };
   return { entry, draft };
 }
 
