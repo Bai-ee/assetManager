@@ -12,9 +12,9 @@
  *   2. Walk images in time order. An image starts a new group unless the previous image is <= 90 s
  *      earlier AND no video lies (in time) between the two; then it joins that group as the B side
  *      (groupedBy 'capture-time'). A group holds at most 2 images.
- *   3. Each video attaches to the nearest image (by absolute time distance) within 10 min; ties prefer
- *      the image BEFORE the video. Videos shot before the first photo of a record are therefore still
- *      attached to the nearest photo.
+ *   3. Each video attaches to the FIRST image shot after it within 10 min (the owner films the record,
+ *      then photographs its label). Only when no later image exists does it fall back to the nearest
+ *      earlier image. (Nearest-by-absolute-time gave labels the next record's video; 2026-10-22 audit.)
  *   4. Videos with no image within 10 min become their own group (groupedBy 'single', images []).
  *   5. Group id = 'g-' + first image fingerprint[0..12] (first video's if no image).
  *   6. Output sorted by the group's earliest time.
@@ -268,25 +268,27 @@ export function groupRecords(files: MediaFile[]): RecordGroup[] {
     prevImage = img;
   }
 
+  // The owner films the record first and photographs the label after it, so a video belongs to the
+  // first label shot AFTER it. Nearest-by-absolute-time handed labels the NEXT record's video
+  // (2026-10-22 audit: 37 of 66 drafts). Fall back to the nearest earlier label only when no later one exists.
   const orphans: MediaFile[] = [];
   for (const v of videos) {
     const vt = bestTime(v);
-    let best: RecordGroup | null = null;
-    let bestDist = Infinity;
-    let bestBefore = false;
+    let after: RecordGroup | null = null;
+    let afterDist = Infinity;
+    let before: RecordGroup | null = null;
+    let beforeDist = Infinity;
     for (const g of groups) {
       for (const img of g.images) {
-        const diff = vt - bestTime(img);
+        const diff = bestTime(img) - vt;
         const dist = Math.abs(diff);
-        const before = diff >= 0;
         if (dist > VIDEO_WINDOW_MS) continue;
-        if (dist < bestDist || (dist === bestDist && before && !bestBefore)) {
-          best = g;
-          bestDist = dist;
-          bestBefore = before;
-        }
+        if (diff >= 0) {
+          if (dist < afterDist) { after = g; afterDist = dist; }
+        } else if (dist < beforeDist) { before = g; beforeDist = dist; }
       }
     }
+    const best = after ?? before;
     if (best) best.videos.push(v);
     else orphans.push(v);
   }

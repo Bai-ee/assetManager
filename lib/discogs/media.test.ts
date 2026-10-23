@@ -26,14 +26,26 @@ test('photos >90s apart are separate records', () => {
   assert.equal(groupRecords([mk('a.HEIC', 'image', 0), mk('b.HEIC', 'image', 200)]).length, 2);
 });
 
-test('a video between two photos splits them', () => {
+test('a video between two photos splits them and belongs to the LATER photo (film first, then label)', () => {
   const g = groupRecords([mk('a.HEIC', 'image', 0), mk('v.MOV', 'video', 20), mk('b.HEIC', 'image', 60)]);
   assert.equal(g.length, 2);
-  assert.equal(g[0].videos.length, 1);
-  assert.equal(g[1].videos.length, 0);
+  assert.equal(g[0].videos.length, 0);
+  assert.equal(g[1].videos[0].name, 'v.MOV');
 });
 
-test('video attaches to nearest photo within 10 min', () => {
+test('video-then-label chain: each label gets the video shot just before it, never the next record\'s', () => {
+  // real cadence from the 2026-09-28 session: video, +2 min label, +2 min next video, +2 min next label …
+  const g = groupRecords([
+    mk('v1.MOV', 'video', 0), mk('l1.HEIC', 'image', 120),
+    mk('v2.MOV', 'video', 240), mk('l2.HEIC', 'image', 360),
+    mk('v3.MOV', 'video', 480), mk('l3.HEIC', 'image', 600),
+  ]);
+  assert.deepEqual(g.map((x) => [x.images[0]?.name, x.videos.map((v) => v.name)]), [
+    ['l1.HEIC', ['v1.MOV']], ['l2.HEIC', ['v2.MOV']], ['l3.HEIC', ['v3.MOV']],
+  ]);
+});
+
+test('video with no later photo falls back to the nearest earlier photo within 10 min', () => {
   const g = groupRecords([mk('a.HEIC', 'image', 0), mk('v.MOV', 'video', 120)]);
   assert.equal(g.length, 1);
   assert.equal(g[0].videos[0].name, 'v.MOV');
