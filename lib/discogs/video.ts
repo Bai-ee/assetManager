@@ -489,8 +489,14 @@ export async function renderClip(
 
 /** HEIC (or any sips-readable image) -> sRGB JPEG, long edge capped at 2000 px. */
 export async function labelToJpeg(srcImage: string, outJpg: string): Promise<void> {
+  const raw = outJpg.replace(/\.jpe?g$/i, '') + '.sips.jpg';
   await run(SIPS, ['-s', 'format', 'jpeg', '-Z', '2000', '-m',
-    '/System/Library/ColorSync/Profiles/sRGB Profile.icc', srcImage, '--out', outJpg]);
+    '/System/Library/ColorSync/Profiles/sRGB Profile.icc', srcImage, '--out', raw]);
+  // Bake the EXIF/display rotation into the pixels. sips keeps it as metadata; ffmpeg 8 then
+  // autorotates the frame, so probeSize (unrotated) and the crop plan disagreed and the crop
+  // was rejected ("Invalid too big ... size") on portrait-shot labels.
+  await run(FFMPEG, ['-hide_banner', '-nostdin', '-y', '-i', raw, '-map_metadata', '-1', '-q:v', '1', '-frames:v', '1', outJpg]);
+  await fs.promises.unlink(raw).catch(() => {});
 }
 
 /** Frame (per plan) + grade a sips-converted label JPEG to one aspect. */

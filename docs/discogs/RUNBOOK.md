@@ -32,6 +32,11 @@ npm run discogs:ingest -- --undo-renames <run>-renames.jsonl # restore NAS names
 # publish
 npm run discogs:publish -- <dir> --dry-run                   # first eligible record, local only, no HITLOOP calls
 npm run discogs:publish -- <dir> --release <id>              # one record, real upload + draft
+  --release <id>                 also accepts an owned (add|already-owned) best match WITHOUT an exact catno (owner override)
+  --release <id> --group <g-id>  pins a [REVIEW] group to a release the owner identified by hand
+  --release <id> --video <file>  renders from that NAS video (file name) instead of the group's longest one;
+                                 also makes a label-only group renderable. Combine with --force to replace a wrong render:
+                                 the draft keeps its post id, the storage files are overwritten (new download token).
 npm run discogs:publish -- <dir> [--limit N]                 # all eligible
   --force            re-publish even if already in published.json
   --x-aspect 1x1|9x16   which variant the draft's legacy paths point at (default 1x1)
@@ -50,6 +55,7 @@ Firebase (via HITLOOP): `publish-staging/discogs/<id>/`.
 - No emoji in post/reply text. Posts are never auto-published. Links go in the first self-reply.
 
 ## Known gaps
+- ⚠️ **Capture-time grouping is off by one when the label is shot AFTER the video** (the 2026-09-28 and 2026-10-09 sessions): each label photo gets the NEXT record's video, so the render shows the wrong record. Always eyeball the clip against the label before scheduling (`ffmpeg -ss 5 -frames:v 1` on `clip-1x1.mp4` next to `label-1x1.jpg`). Fix a bad one with `--release <id> --force --video <correct file>`. Do NOT run `--apply --rename` over such a session: the videos would be renamed after the wrong record. Found 2026-10-21 on Bob Sinclar / Mo Pschidt / Tone Theory / Rhythm Masters / Todd Edwards; Fantom – Faithfull (591124) has no video on the NAS at all (its draft is parked `rejected`).
 - Panel v1 covers Plan + Add to collection + Undo only; NAS renames and render/draft stay CLI-only.
 - HITLOOP Studio tab is not built.
 - Matcher may propose idea rows.

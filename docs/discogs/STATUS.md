@@ -9,6 +9,10 @@
 
 - Dashboard panel (Plan + Add to collection + Undo): Mac side done (`lib/discogs/{run,analyzer-plugin,analyzer-entry}.ts`, served by the analyzer). HITLOOP actions + UI per `DISCOGS-PANEL-CONTRACT.md` are built separately; end-to-end not yet verified live.
 
+## 2026-10-21 session
+- Published drafts (home client): Mo Pschidt 24527, Tone Theory 1093094 (white vinyl, pinned by hand), Rhythm Masters 150716, Todd Edwards 61824 — all re-rendered from the correct video after the grouping off-by-one (RUNBOOK § Known gaps). Fantom 591124 parked (no video on NAS).
+- Code (uncommitted): `publish.ts`/`publish-cli.ts` owner overrides `--release` / `--group` / `--video`; `video.ts` `labelToJpeg` bakes EXIF rotation (portrait labels failed `crop` under ffmpeg 8).
+
 ## Not done / not verified
 - Self-reply posting to X is built on the HITLOOP side (commit a6dc96a3); not re-verified live from this repo.
 - HITLOOP Studio tab not built.

@@ -1,7 +1,11 @@
 /**
  * Discogs -> X draft publisher (worker side).
  *
- *   npm run discogs:publish -- <dir> [--release <id>] [--limit N] [--dry-run] [--force]
+ *   npm run discogs:publish -- <dir> [--release <id> [--group <g-id>]] [--limit N] [--dry-run] [--force]
+ *   --release alone also accepts a non-exact-catno plan whose best match is that release (owner override);
+ *   --release + --group pins a review group to a release the owner identified by hand.
+ *   --release + --video <file name> renders from that NAS video instead of the group's longest one
+ *   (capture-time grouping can hand a label photo the NEXT record's video).
  *
  * Record selection: re-scan + group <dir>, then match each group to the saved plans in
  * ~/.discogs-ingest/runs/*-plan.json by group id (content fingerprint, so it survives NAS
@@ -78,10 +82,11 @@ const framingLine = (f: FramingDecision, a: Aspect) =>
 interface LocalSource { video: ScannedMedia; local: string; fingerprint: string; copySeconds: number }
 
 /** Longest video of the record (duration from the scan index) -> local copy in the source cache. Never re-copies. */
-async function fetchSource(rec: EligibleRecord): Promise<LocalSource> {
+async function fetchSource(rec: EligibleRecord, override?: ScannedMedia): Promise<LocalSource> {
   const vids = rec.group.videos as ScannedMedia[];
   const dur = (v: ScannedMedia) => v.durationS ?? 0;
-  const video = [...vids].sort((a, b) => dur(b) - dur(a) || b.size - a.size)[0];
+  const video = override ?? [...vids].sort((a, b) => dur(b) - dur(a) || b.size - a.size)[0];
+  if (override) console.log(`  [release ${rec.releaseId}] source video overridden: ${override.name}`);
   const legacyDir = join(WORK, String(rec.releaseId));
   const legacyPaths = existsSync(legacyDir) ? readdirSync(legacyDir).filter(n => n.startsWith('source.')).map(n => join(legacyDir, n)) : [];
   const r = await ensureLocalSource(video, SRC_CACHE, {
@@ -172,11 +177,15 @@ async function uploadFile(h: ReturnType<typeof hitloop>, releaseId: number, kind
 }
 
 async function main() {
-  const dir = process.argv.slice(2).find(a => !a.startsWith('--') && a !== arg('--release') && a !== arg('--limit') && a !== arg('--x-aspect') && a !== arg('--clip-mode'));
-  if (!dir) { console.error('usage: discogs:publish <dir> [--release <id>] [--limit N] [--dry-run] [--force] [--x-aspect 1x1|9x16] [--clip-mode auto|beginning|break]'); process.exit(1); }
+  const dir = process.argv.slice(2).find(a => !a.startsWith('--') && a !== arg('--release') && a !== arg('--group') && a !== arg('--video') && a !== arg('--limit') && a !== arg('--x-aspect') && a !== arg('--clip-mode'));
+  if (!dir) { console.error('usage: discogs:publish <dir> [--release <id> [--group <g-id>]] [--limit N] [--dry-run] [--force] [--x-aspect 1x1|9x16] [--clip-mode auto|beginning|break]'); process.exit(1); }
   const dryRun = process.argv.includes('--dry-run');
   const force = process.argv.includes('--force');
   const releaseArg = arg('--release') ? Number(arg('--release')) : undefined;
+  const groupArg = arg('--group') || undefined;
+  const videoArg = arg('--video') || undefined;
+  if (videoArg && releaseArg === undefined) throw new Error('--video needs --release');
+  if (groupArg && releaseArg === undefined) throw new Error('--group needs --release');
   const limit = Number(arg('--limit') ?? Infinity);
   const xAspect = (arg('--x-aspect') ?? '1x1') as Aspect;
   if (!ASPECT_LIST.includes(xAspect)) throw new Error(`--x-aspect must be one of ${ASPECT_LIST.join(', ')}`);
@@ -191,9 +200,16 @@ async function main() {
   const published = readJson<PublishedEntry[]>(PUBLISHED, []);
   const plans = loadPlansNewestFirst();
   const tScan = Date.now();
-  const groups = groupRecords(await scanFolder(dir, { indexPath: DEFAULT_INDEX_PATH }));
+  const scanned = await scanFolder(dir, { indexPath: DEFAULT_INDEX_PATH });
+  const groups = groupRecords(scanned);
+  const videoOverride = videoArg ? scanned.find(m => m.kind === 'video' && basename(m.path) === videoArg) : undefined;
+  if (videoArg && !videoOverride) throw new Error(`--video ${videoArg} not found in ${dir}`);
   console.log(`scan: ${((Date.now() - tScan) / 1000).toFixed(1)}s (index ${DEFAULT_INDEX_PATH})`);
-  const sel = selectEligible(groups, plans, new Set(published.map(p => p.releaseId)), { release: releaseArg, force });
+  const sel = selectEligible(groups, plans, new Set(published.map(p => p.releaseId)), { release: releaseArg, force, group: groupArg });
+  if (videoOverride) { // a label-only group becomes renderable once the owner names its video
+    const i = sel.noVideo.findIndex(r => r.releaseId === releaseArg);
+    if (i >= 0) sel.eligible.push(...sel.noVideo.splice(i, 1));
+  }
   console.log(`${groups.length} groups, ${plans.length} saved plan entries. eligible ${sel.eligible.length} | no video ${sel.noVideo.length} | already published ${sel.alreadyPublished.length}`);
   for (const r of sel.noVideo) console.log(`  skipped (no video): release ${r.releaseId} ${r.plan.best!.title}`);
   for (const id of sel.alreadyPublished) console.log(`  skipped (already published): release ${id}`);
@@ -209,7 +225,7 @@ async function main() {
   const fetchAt = (i: number) => {
     if (i >= todo.length) return;
     if (!sources.has(i)) {
-      const p = fetchSource(todo[i]);
+      const p = fetchSource(todo[i], videoOverride);
       p.catch(() => {}); // the error is reported when record i is reached
       sources.set(i, p);
     }

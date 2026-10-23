@@ -53,12 +53,16 @@ export function isConfident(p: GroupPlan): boolean {
  * content-based so it survives NAS renames. Plans are passed newest-first; the newest plan
  * that knows a group wins. Falls back to any shared image fingerprint (group boundaries can
  * shift between runs). Groups without a confident plan are dropped; one record per release.
+ *
+ * Owner overrides (explicit `--release`): a plan whose best match IS that release on an
+ * add|already-owned action is accepted even without an exact catno; with `--group` as well,
+ * that group is pinned to the release regardless of what the plan matched (review rows).
  */
 export function selectEligible(
   groups: RecordGroup[],
   plansNewestFirst: GroupPlan[],
   published: Set<number>,
-  opts: { release?: number; force?: boolean } = {},
+  opts: { release?: number; force?: boolean; group?: string } = {},
 ): { eligible: EligibleRecord[]; noVideo: EligibleRecord[]; alreadyPublished: number[] } {
   const byId = new Map<string, GroupPlan>();
   const byFp = new Map<string, GroupPlan>();
@@ -72,8 +76,13 @@ export function selectEligible(
   const seen = new Set<number>();
   for (const g of groups) {
     const plan = byId.get(g.id) ?? g.images.map(i => byFp.get(i.fingerprint)).find(Boolean);
-    if (!plan || !isConfident(plan) || !g.images.length) continue;
-    const releaseId = plan.best!.releaseId;
+    if (!plan || !g.images.length) continue;
+    const pinned = opts.release !== undefined && opts.group !== undefined && g.id === opts.group;
+    const ownerOverride = opts.release !== undefined && opts.group === undefined
+      && plan.best?.releaseId === opts.release && (plan.action === 'add' || plan.action === 'already-owned');
+    if (!pinned && !ownerOverride && !isConfident(plan)) continue;
+    if (opts.group !== undefined && !pinned) continue;
+    const releaseId = pinned ? opts.release! : plan.best!.releaseId;
     if (opts.release !== undefined && releaseId !== opts.release) continue;
     if (seen.has(releaseId)) continue;
     seen.add(releaseId);
