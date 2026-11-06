@@ -20,7 +20,8 @@
     "discogs:check": "node --experimental-strip-types --env-file-if-exists=.env.local lib/discogs/check-cli.ts",
     "discogs:doctor": "tsx --env-file-if-exists=.env.local lib/discogs/doctor-cli.ts",
     "discogs:ingest": "tsx --env-file-if-exists=.env.local lib/discogs/ingest-cli.ts",
-    "test:discogs": "tsx --test lib/discogs/*.test.ts"
+    "test:discogs": "tsx --test lib/discogs/*.test.ts",
+    "photolib:inspect": "tsx lib/photolib/inspect.ts"
   },
   "dependencies": {
     "next": "^14.2.0",
