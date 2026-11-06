@@ -256,7 +256,7 @@ export function inspect(libPath: string, opts: { compare?: string[]; exifSample?
     // --- in-library dupes (same name+size, or same fingerprint)
     const seen = new Map<string, number>();
     for (const x of live) { const k = x.fingerprint ?? dupKey(x.originalFileName, x.fileSize); if (k) seen.set(k, (seen.get(k) ?? 0) + 1); }
-    const dupExtra = [...seen.values()].reduce((s, n) => s + (n - 1), 0);
+    const dupExtra = Array.from(seen.values()).reduce((s, n) => s + (n - 1), 0);
     r.dupesWithinLibrary = { extraCopies: dupExtra, key: lib.kind === 'photos' ? 'fingerprint' : 'name+size' };
     r.estCopy = {
       files: diskFiles.length - missing.length - dupExtra,
@@ -289,14 +289,14 @@ export function inspect(libPath: string, opts: { compare?: string[]; exifSample?
     r.orphanExif = { files: orphans.length, withCaptureDate: oDated, withContentIdentifier: contentIds };
 
     // --- live photo partners (MOV with ContentIdentifier anywhere under the bundle's Masters+resources)
-    const movs = [...diskFiles, ...resFiles].filter((f) => /\.mov$/i.test(f));
+    const movs = diskFiles.concat(resFiles).filter((f) => /\.mov$/i.test(f));
     const movExif = exiftoolJson(movs);
     const movIds = new Set(movExif.map((e) => e.ContentIdentifier).filter(Boolean).map(String));
     const groupIds = new Set(live.map((x) => x.mediaGroupId).filter(Boolean).map(String));
     r.livePairs = {
       dbGroups: groupIds.size,
       movWithContentId: movIds.size,
-      matchedGroups: [...groupIds].filter((g) => movIds.has(g)).length,
+      matchedGroups: Array.from(groupIds).filter((g) => movIds.has(g)).length,
     };
 
     // --- cross-library dupes
@@ -339,7 +339,7 @@ export function toMarkdown(r: Record<string, any>): string {
     `| dupes within library (${r.dupesWithinLibrary.key}) | ${r.dupesWithinLibrary.extraCopies} |`,
     `| est. copy | ${r.estCopy.files} files · ${gb(r.estCopy.bytes)} (${r.estCopy.note}) |`,
     '', 'Orphan sample:', ...k.orphanSample.map((s: string) => `- \`${s}\``),
-    '', 'Resources samples:', ...[...r.resources.movSample, ...r.resources.fullsizeSample].map((s: string) => `- \`${s}\``),
+    '', 'Resources samples:', ...r.resources.movSample.concat(r.resources.fullsizeSample).map((s: string) => `- \`${s}\``),
     '', '## EXIF spot-check (DB imageDate vs EXIF DateTimeOriginal)',
     `Sampled ${x.sampled}, EXIF-dated ${x.exifDated}. Match if imageDate = UTC instant (+tz): **${x.matchIfImageDateIsUtc}** · if wall clock: **${x.matchIfImageDateIsWallClock}**.`,
     '', '| file | EXIF | EXIF offset | DB utc+tz | DB raw | tz |', '|---|---|---|---|---|---|',
