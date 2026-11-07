@@ -21,7 +21,8 @@
     "discogs:doctor": "tsx --env-file-if-exists=.env.local lib/discogs/doctor-cli.ts",
     "discogs:ingest": "tsx --env-file-if-exists=.env.local lib/discogs/ingest-cli.ts",
     "test:discogs": "tsx --test lib/discogs/*.test.ts",
-    "photolib:inspect": "tsx lib/photolib/inspect.ts"
+    "photolib:inspect": "tsx lib/photolib/inspect.ts",
+    "photolib": "tsx --env-file-if-exists=.env.local lib/photolib/cli.ts"
   },
   "dependencies": {
     "@ardrive/turbo-sdk": "^1.29.0",
