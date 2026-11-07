@@ -5,6 +5,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { pipeline } from 'stream/promises';
 import { sha256File } from '../archive/hash';
 import type { Plan, PlanItem, Sidecar, SidecarChild, SidecarLocation, ChildRole } from './types';
 import { photolibHome } from './manifest';
@@ -81,9 +82,9 @@ async function withApplyLock<T>(lockPath: string, fn: () => Promise<T>): Promise
   }
 }
 
-const STALE_TMP_MS = 60 * 60 * 1000;
+const STALE_TMP_MS = 10 * 60 * 1000;
 
-/** Remove crashed-run `*.photolib-tmp-*` files older than 1h from the plan's destination dirs (timeline root only). */
+/** Remove crashed-run `*.photolib-tmp-*` files older than 10 min from the plan's destination dirs (timeline root only). */
 function sweepStaleTemps(plan: Plan, nowMs: number): void {
   const dirs = new Set<string>();
   const add = (rel: string) => { try { dirs.add(path.dirname(assertSafeDest(plan.destRoot, rel))); } catch { /* unsafe path: ignore */ } };
@@ -113,12 +114,20 @@ const fileSize = (p: string): number | null => { try { const s = fs.statSync(p);
 const rand = () => crypto.randomBytes(4).toString('hex');
 const extOf = (p: string) => path.extname(p).slice(1).toLowerCase();
 
+/**
+ * Streamed exclusive copy. Avoids copyfile(3), which on macOS attempts a server-side copy on SMB shares
+ * and makes the NAS drop the mount for large files. 'wx' keeps COPYFILE_EXCL semantics. Caller cleans up dest.
+ */
+export async function streamCopyExclusive(src: string, dest: string): Promise<void> {
+  await pipeline(fs.createReadStream(src, { highWaterMark: 8 * 1024 * 1024 }), fs.createWriteStream(dest, { flags: 'wx' }));
+}
+
 /** Copy src -> dest through a verified temp file. Never overwrites dest. */
 async function copyVerified(src: string, dest: string, sha: string, hashFile: (p: string) => Promise<string>): Promise<CopyOutcome> {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const tmp = `${dest}.photolib-tmp-${rand()}`;
   try {
-    await fs.promises.copyFile(src, tmp, fs.constants.COPYFILE_EXCL);
+    await streamCopyExclusive(src, tmp);
     const srcSize = fs.statSync(src).size;
     if (fs.statSync(tmp).size !== srcSize) throw new Error('copy size mismatch');
     if ((await hashFile(tmp)) !== sha) throw new Error('copy sha256 mismatch (source changed since plan?)');

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Manifest } from './manifest';
 import { buildPlan } from './plan';
-import { applyPlan, undoRun } from './apply';
+import { applyPlan, undoRun, streamCopyExclusive } from './apply';
 import { makeFixture, listFiles, sha, snapshotTree, tmpDir, type Fixture } from './test-fixtures';
 import type { Plan, Sidecar } from './types';
 
@@ -212,4 +212,15 @@ test('apply: a throw outside the per-item loop marks the run failed and rethrows
   assert.equal(m.getRun(runId)?.state, 'failed');
   assert.ok(JSON.parse(m.getRun(runId)!.summaryJson!).locations.length === 1, 'locations kept so undo still works');
   m.close();
+});
+
+test('streamCopyExclusive: copies bytes exactly and refuses to overwrite', async () => {
+  const d = tmpDir();
+  const src = path.join(d, 'src.bin'), dest = path.join(d, 'dest.bin');
+  const data = Buffer.from(Array.from({ length: 300000 }, (_, i) => i % 251));
+  fs.writeFileSync(src, data);
+  await streamCopyExclusive(src, dest);
+  assert.ok(fs.readFileSync(dest).equals(data));
+  await assert.rejects(() => streamCopyExclusive(src, dest), /EEXIST/);
+  assert.ok(fs.readFileSync(dest).equals(data), 'existing dest untouched');
 });
