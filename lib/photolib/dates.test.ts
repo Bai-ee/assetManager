@@ -152,3 +152,11 @@ test('bucketOf uses LOCAL day, not UTC day', () => {
   assert.deepEqual(bucketOf(m), { ym: '2018-06', day: '2018-06-30' });
   assert.deepEqual(bucketOf(resolveTakenDate(NONE, null)), { ym: 'unknown', day: null });
 });
+
+test('library-db LMT-style offset keeps local wall clock, rounds tz to 15 min', () => {
+  // real case: IMG_6487 — EXIF 2018:03:04 20:23:29, library offset -21540 (-05:59)
+  const r = resolveTakenDate({ imageDateUtc: '2018-03-05T02:22:29.000Z', tzOffsetSec: -21540 }, null);
+  assert.equal(r.takenLocal, '2018-03-04T20:23:29');
+  assert.equal(r.tz, '-06:00');
+  assert.equal(r.tsUtc, '2018-03-05T02:23:29.000Z');
+});

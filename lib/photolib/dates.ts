@@ -73,7 +73,10 @@ export function resolveTakenDate(item: Pick<LibraryItem, 'imageDateUtc' | 'tzOff
     if (!Number.isNaN(t) && new Date(t).getUTCFullYear() >= MIN_YEAR) {
       const off = item.tzOffsetSec;
       if (off !== null && off !== undefined && Math.abs(off) <= MAX_OFFSET_SEC) {
-        return exact(t + off * 1000, off, 'library-db');
+        // Library offsets can be LMT-style (e.g. -05:59). The local wall clock (utc + raw offset) matches EXIF,
+        // so keep it and round the offset to 15 min; tsUtc is recomputed from the rounded offset.
+        const rounded = Math.round(off / 900) * 900;
+        return exact(t + off * 1000, rounded, 'library-db');
       }
       const dto = exif?.dateTimeOriginal ? wallClockMs(exif.dateTimeOriginal) : null;
       if (dto) return { ...localOnly(dto.ms, 'library-db') };
