@@ -10,7 +10,7 @@ import type { ChildFile, ChildRole, ExifInfo, LibraryItem, Plan, PlanItem, ReadL
 import type { Manifest } from './manifest';
 
 export interface PlanDeps {
-  readLibrary: (libraryPath: string, opts: { sourceId: string }) => ReadLibraryResult;
+  readLibrary: (libraryPath: string, opts: { sourceId: string; log?: (msg: string) => void }) => ReadLibraryResult | Promise<ReadLibraryResult>;
   readExifBatch: (paths: string[], opts?: { concurrency?: number }) => Promise<Map<string, ExifInfo | null>>;
   resolveTakenDate: (item: Pick<LibraryItem, 'imageDateUtc' | 'tzOffsetSec'>, exif: ExifInfo | null) => ResolvedDate;
   canonicalPathFor: (date: ResolvedDate, parentSha256: string, ext: string, role?: 'motion' | 'edited') => string;
@@ -18,7 +18,7 @@ export interface PlanDeps {
   hashFile?: (p: string) => Promise<string>;
 }
 
-export interface PlanProgress { phase: 'read' | 'hash' | 'exif' | 'classify'; done: number; total: number }
+export interface PlanProgress { phase: 'read' | 'scan' | 'hash' | 'exif' | 'classify'; done: number; total: number }
 
 export interface BuildPlanOptions {
   libraryPath: string;
@@ -28,6 +28,8 @@ export interface BuildPlanOptions {
   manifest: Manifest;
   deps: PlanDeps;
   onProgress?: (p: PlanProgress) => void;
+  /** Human-readable scan progress (folder source); the CLI sends it to stderr. */
+  log?: (msg: string) => void;
   now?: () => Date;
 }
 
@@ -42,7 +44,7 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
   const { manifest, deps, destRoot, sourceId } = opts;
   const hashFile = deps.hashFile ?? sha256File;
   const now = (opts.now ?? (() => new Date()))();
-  const lib = deps.readLibrary(opts.libraryPath, { sourceId });
+  const lib = await deps.readLibrary(opts.libraryPath, { sourceId, log: opts.log });
   const items = opts.limit && opts.limit > 0 ? lib.items.slice(0, opts.limit) : lib.items;
   const warnings = [...lib.warnings];
   opts.onProgress?.({ phase: 'read', done: items.length, total: items.length });
@@ -78,7 +80,9 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
 
   const exifPaths = items.map(i => i.absPath);
   for (const it of items) { if (it.motion) exifPaths.push(it.motion.absPath); }
-  const exifMap = await deps.readExifBatch(exifPaths);
+  const exifMap = new Map(lib.exif ?? []);
+  const needExif = exifPaths.filter(p => !exifMap.has(p));
+  if (needExif.length) (await deps.readExifBatch(needExif)).forEach((v, k) => exifMap.set(k, v));
   opts.onProgress?.({ phase: 'exif', done: items.length, total: items.length });
 
   const destSize = (rel: string): number | null => {
@@ -149,7 +153,7 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
     destRoot,
     createdAt: now.toISOString(),
     items: out,
-    totals,
+    totals: lib.skippedNoDate !== undefined ? { ...totals, skippedNoDate: lib.skippedNoDate } : totals,
     warnings,
   };
 }

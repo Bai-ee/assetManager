@@ -83,3 +83,14 @@ Add `isLibraryBundle(name)` in `lib/archive/media-type.ts` (`/\.(photoslibrary|p
 
 ## Thumbnails
 JPEG, not WebP: this Mac's ffmpeg has no libwebp and `sips` cannot write WebP (2026-11-06); no new tools added. Storage: `life-thumbs/<sha16>_{s,m}.jpg`, contentType `image/jpeg`.
+
+## Folder source (`--folder`)
+`npm run photolib -- plan --folder <abs dir> [--dest-root /Volumes/bryan] [--source-id id] [--limit N]` plans loose photos/videos from a plain directory tree; the resulting `Plan` (`libraryKind: 'folder'`) is applied/thumbed/pushed/undone by the unchanged commands (`apply --plan <planId>`). `--folder` and `--library` are mutually exclusive; the folder must be inside `--dest-root`.
+- Read-only. Walker (`folder-reader.ts`) uses an explicit stack, skips symlinks, hidden entries (leading `.`, incl. `._*` AppleDouble, `.Trashes`, `.Spotlight-V100`), `$RECYCLE.BIN`, `HITLOOP-ARCHIVE`, `*.backupbundle`, `*.sparsebundle` and library bundles (`isLibraryBundle`). Per-directory read errors become warnings. Progress goes to stderr every ~1000 files.
+- Extensions (case-insensitive): images jpg jpeg heic heif png gif tif tiff cr2 nef arw dng raf orf rw2; videos mov mp4 m4v avi 3gp mts. Files < 10 KB skipped.
+- Only files with capture metadata are planned: EXIF/QuickTime is read first (500-file batches), then `resolveTakenDate` runs with `imageDateUtc:null`. `tsKind:'unknown'` → skipped, counted in `plan.totals.skippedNoDate` (plus a warning listing ≤10 examples). File mtime/birthtime is never used.
+- Hashing happens only after that filter; hash cache and dedupe (`duplicate` = same sha already in manifest/plan) are unchanged.
+- Live Photo: image + video in the SAME directory, same basename (case-insensitive), equal non-null EXIF `contentIdentifier` → video is the image's `motion` child. No `edited` children.
+- Items: `masterUuid` = first 32 hex of sha256(relativePath), `versionUuid` null, no albums/title/keywords; `relativePath` is relative to the folder; `plan.libraryPath` = folder relative to dest root.
+- sourceId default `folder-<slug of folder path relative to dest root>` (`Dec10th MAc Backup` → `folder-dec10th-mac-backup`); source kind `folder`, label = the relative path.
+- Contract changes: `LibraryKind` gains `'folder'`; `ReadLibraryResult` gains optional `exif`, `skippedNoDate`; `Plan.totals` gains optional `skippedNoDate`; `PlanDeps.readLibrary` may be async. HITLOOP `source.kind` accepts `folder`.

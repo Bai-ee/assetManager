@@ -4,7 +4,7 @@
  * HITLOOP mirror: features/life-timeline/CONTRACT.md.
  */
 
-export type LibraryKind = 'photos' | 'iphoto';
+export type LibraryKind = 'photos' | 'iphoto' | 'folder';
 export type MediaKind = 'image' | 'video';
 export type TsSource = 'library-db' | 'exif' | 'quicktime';
 export type ChildRole = 'motion' | 'edited';
@@ -57,6 +57,10 @@ export interface ReadLibraryResult {
   items: LibraryItem[];
   /** Non-fatal problems (missing file on disk, unreadable row, etc). */
   warnings: { masterUuid?: string; relativePath?: string; reason: string }[];
+  /** Folder source only: EXIF already read while filtering (keyed by absPath), so plan does not re-read it. */
+  exif?: Map<string, ExifInfo | null>;
+  /** Folder source only: candidate files dropped because no capture date could be resolved. */
+  skippedNoDate?: number;
 }
 
 /** Subset of exiftool output used by the date policy + pairing. */
@@ -164,7 +168,7 @@ export interface Plan {
   destRoot: string; // absolute share root, e.g. /Volumes/bryan
   createdAt: string;
   items: PlanItem[];
-  totals: { items: number; copy: number; present: number; duplicate: number; conflict: number; children: number; bytes: number };
+  totals: { items: number; copy: number; present: number; duplicate: number; conflict: number; children: number; bytes: number; /** Folder plans only. */ skippedNoDate?: number };
   warnings: ReadLibraryResult['warnings'];
 }
 

@@ -1,5 +1,5 @@
 /**
- * npm run photolib -- <plan|apply|undo|thumbs|push|status> --library <abs> [--dest-root /Volumes/bryan] [--source-id id]
+ * npm run photolib -- <plan|apply|undo|thumbs|push|status> (--library <abs bundle> | --folder <abs dir>) [--dest-root /Volumes/bryan] [--source-id id]
  *   [--limit N] [--plan <planId>] [--run <runId>] [--force] [--json]
  * Pure helpers are exported for tests; main() only runs when this file is executed directly.
  */
@@ -13,6 +13,7 @@ export const DEFAULT_DEST_ROOT = '/Volumes/bryan';
 export interface CliArgs {
   command: CliCommand;
   library?: string;
+  folder?: string;
   destRoot: string;
   sourceId?: string;
   limit?: number;
@@ -35,6 +36,7 @@ export function parseArgs(argv: string[]): CliArgs {
     const a = rest[i];
     switch (a) {
       case '--library': out.library = value(i, a); i++; break;
+      case '--folder': out.folder = value(i, a); i++; break;
       case '--dest-root': out.destRoot = value(i, a); i++; break;
       case '--source-id': out.sourceId = value(i, a); i++; break;
       case '--plan': out.plan = value(i, a); i++; break;
@@ -49,6 +51,7 @@ export function parseArgs(argv: string[]): CliArgs {
       default: throw new Error(`Unknown argument ${a}`);
     }
   }
+  if (out.library && out.folder) throw new Error('--library and --folder are mutually exclusive');
   return out;
 }
 
@@ -74,6 +77,21 @@ export function deriveSourceId(libraryPath: string): string {
   const parent = dirname(abs);
   if (kind === 'photos') return `photos-${slug(basename(parent))}`;
   return `iphoto-${slug(basename(basename(abs) === 'iPhoto Library' ? dirname(parent) : parent))}`;
+}
+
+/** Folder source id: folder-<slug of the folder path relative to the dest root, segments joined with '-'>. */
+export function deriveFolderSourceId(folderPath: string, destRoot: string): string {
+  const rel = shareRelative(destRoot, folderPath);
+  if (rel === null) throw new Error('--folder must be inside --dest-root (paths are stored share-relative)');
+  return `folder-${slug(rel.split('/').join(' '))}`;
+}
+
+/** Throws unless the path is an absolute directory path (not a library bundle — use --library for those). */
+export function assertFolder(folderPath: string | undefined): string {
+  if (!folderPath) throw new Error('--folder <absolute path> is required');
+  if (!isAbsolute(folderPath)) throw new Error('--folder must be an absolute path');
+  if (libraryKindOf(folderPath)) throw new Error('--folder is a photo library bundle; use --library for those');
+  return stripSlash(resolve(folderPath));
 }
 
 /** Throws unless the path is an absolute, recognised library bundle. */
@@ -119,16 +137,20 @@ export async function main(argv: string[]): Promise<number> {
   const manifest = await deps.openManifest();
   let result: unknown;
   try {
-    const needLibrary = () => assertLibrary(args.library);
+    const isFolder = args.folder !== undefined;
+    /** The source path for this run: a library bundle (--library) or a plain directory (--folder). */
+    const needLibrary = () => (isFolder ? assertFolder(args.folder) : assertLibrary(args.library));
+    const sourceIdFor = (library: string, destRoot: string) =>
+      args.sourceId ?? (isFolder ? deriveFolderSourceId(library, destRoot) : deriveSourceId(library));
     const planNow = async () => {
       const library = needLibrary();
       const destRoot = assertDestRootSafe(args.destRoot, library);
-      const sourceId = args.sourceId ?? deriveSourceId(library);
+      const sourceId = sourceIdFor(library, destRoot);
       const rel = shareRelative(destRoot, library);
-      if (rel === null) throw new Error('--library must be inside --dest-root (paths are stored share-relative)');
-      (manifest as { upsertSource?: (s: unknown) => void }).upsertSource?.({ id: sourceId, kind: libraryKindOf(library), libraryPath: rel, label: basename(dirname(library)), addedAt: new Date().toISOString() });
+      if (rel === null) throw new Error(`${isFolder ? '--folder' : '--library'} must be inside --dest-root (paths are stored share-relative)`);
+      (manifest as { upsertSource?: (s: unknown) => void }).upsertSource?.({ id: sourceId, kind: isFolder ? 'folder' : libraryKindOf(library), libraryPath: rel, label: isFolder ? rel : basename(dirname(library)), addedAt: new Date().toISOString() });
       line(args, `plan ${sourceId} ← ${library}`);
-      const plan = await deps.buildPlan({ libraryPath: library, destRoot, sourceId, limit: args.limit, manifest, onProgress });
+      const plan = await deps.buildPlan({ libraryPath: library, destRoot, sourceId, limit: args.limit, manifest, onProgress, folder: isFolder, log: args.json ? undefined : (m: string) => console.error(m) });
       await deps.savePlan(plan, home);
       line(args, `planId ${plan.planId}  ${JSON.stringify(plan.totals)}  warnings ${plan.warnings.length}`);
       return plan;
@@ -163,11 +185,11 @@ export async function main(argv: string[]): Promise<number> {
         const library = needLibrary();
         const destRoot = assertDestRootSafe(args.destRoot, library);
         const rel = shareRelative(destRoot, library);
-        if (rel === null) throw new Error('--library must be inside --dest-root (paths are pushed share-relative)');
-        const sourceId = args.sourceId ?? deriveSourceId(library);
+        if (rel === null) throw new Error(`${isFolder ? '--folder' : '--library'} must be inside --dest-root (paths are pushed share-relative)`);
+        const sourceId = sourceIdFor(library, destRoot);
         result = await deps.runPush({
           manifest, limit: args.limit, force: args.force, isCancelled, onProgress,
-          source: { id: sourceId, kind: libraryKindOf(library) as LibraryKind, label: basename(dirname(library)), libraryPath: rel },
+          source: { id: sourceId, kind: (isFolder ? 'folder' : libraryKindOf(library)) as LibraryKind, label: isFolder ? rel : basename(dirname(library)), libraryPath: rel },
         });
         line(args, `push ${JSON.stringify(result)}`);
         break;
