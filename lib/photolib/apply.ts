@@ -119,7 +119,38 @@ const extOf = (p: string) => path.extname(p).slice(1).toLowerCase();
  * and makes the NAS drop the mount for large files. 'wx' keeps COPYFILE_EXCL semantics. Caller cleans up dest.
  */
 export async function streamCopyExclusive(src: string, dest: string): Promise<void> {
-  await pipeline(fs.createReadStream(src, { highWaterMark: 8 * 1024 * 1024 }), fs.createWriteStream(dest, { flags: 'wx' }));
+  const size = fs.statSync(src).size;
+  const stage = stagePathFor(size);
+  if (!stage) {
+    await streamPlain(src, dest);
+    return;
+  }
+  try {
+    // Large files: the NAS drops the share when it reads and writes a big file at once, so do the two legs separately.
+    await streamPlain(src, stage);
+    await streamPlain(stage, dest);
+  } finally {
+    fs.rmSync(stage, { force: true });
+  }
+}
+
+const streamPlain = (from: string, to: string) =>
+  pipeline(fs.createReadStream(from, { highWaterMark: 8 * 1024 * 1024 }), fs.createWriteStream(to, { flags: 'wx' }));
+
+/** Local stage file path for a copy of `size` bytes, or null when staging is off, not needed, or the disk is too full. */
+function stagePathFor(size: number): string | null {
+  if (process.env.PHOTOLIB_NO_STAGE === '1') return null;
+  const envMin = process.env.PHOTOLIB_STAGE_MIN_BYTES;
+  const min = envMin != null && envMin !== '' && Number.isFinite(Number(envMin)) ? Number(envMin) : 100 * 1024 * 1024;
+  if (size < min) return null;
+  const dir = path.join(photolibHome(), 'stage');
+  fs.mkdirSync(dir, { recursive: true });
+  const st = fs.statfsSync(dir);
+  if (st.bavail * st.bsize < size + 2 * 1024 ** 3) {
+    console.warn('photolib: not enough local disk to stage, copying directly');
+    return null;
+  }
+  return path.join(dir, `${rand()}.part`);
 }
 
 /** Copy src -> dest through a verified temp file. Never overwrites dest. */

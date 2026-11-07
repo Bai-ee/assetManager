@@ -224,3 +224,26 @@ test('streamCopyExclusive: copies bytes exactly and refuses to overwrite', async
   await assert.rejects(() => streamCopyExclusive(src, dest), /EEXIST/);
   assert.ok(fs.readFileSync(dest).equals(data), 'existing dest untouched');
 });
+
+test('streamCopyExclusive: staged path copies exactly and leaves the stage dir empty', async () => {
+  const dir = tmpDir();
+  const prev = { h: process.env.PHOTOLIB_HOME, m: process.env.PHOTOLIB_STAGE_MIN_BYTES, n: process.env.PHOTOLIB_NO_STAGE };
+  process.env.PHOTOLIB_HOME = path.join(dir, 'home');
+  process.env.PHOTOLIB_STAGE_MIN_BYTES = '0';
+  delete process.env.PHOTOLIB_NO_STAGE;
+  try {
+    const src = path.join(dir, 'a.bin');
+    const dest = path.join(dir, 'b.bin');
+    fs.writeFileSync(src, Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 251)));
+    await streamCopyExclusive(src, dest);
+    assert.ok(fs.readFileSync(src).equals(fs.readFileSync(dest)));
+    await assert.rejects(() => streamCopyExclusive(src, dest), /EEXIST/);
+    const stageDir = path.join(dir, 'home', 'stage');
+    assert.ok(fs.existsSync(stageDir));
+    assert.deepEqual(fs.readdirSync(stageDir), []);
+  } finally {
+    for (const [k, v] of [['PHOTOLIB_HOME', prev.h], ['PHOTOLIB_STAGE_MIN_BYTES', prev.m], ['PHOTOLIB_NO_STAGE', prev.n]] as const) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
