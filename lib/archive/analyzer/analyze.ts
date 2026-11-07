@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { sha256File } from '../hash';
-import { inferMediaType } from '../media-type';
+import { inferMediaType, isLibraryBundle } from '../media-type';
 import { BATCH_DISCOUNT, appendLedger, cacheKey, callCostUsd, estimateCallUsd, estimateRun, round6, withinCap } from './cost';
 import { withEventDates } from './event-date';
 import { DEFAULT_MODEL, PROMPT_VERSION, sanitizeAnalysis } from './schema';
@@ -43,6 +43,8 @@ export function walkMedia(root: string, paths: string[], opts: { index?: WalkInd
   const visit = (abs: string): ListingEntry | null => {
     const base = path.basename(abs);
     if (base.startsWith('.')) return null;
+    if (isLibraryBundle(base)) return null; // photo-library bundles are read-only; photolib reads them
+    if (relOf(abs) === 'HITLOOP-ARCHIVE/timeline') return null; // photolib's canonical copies
     if (isAnalyzerContentDir(relOf(abs))) return null; // our own organized copies (legacy + per-client)
     let st: fs.Stats;
     try { st = fs.lstatSync(abs); } catch { return null; }

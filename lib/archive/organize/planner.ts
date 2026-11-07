@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { ArchiveDatabase } from '../database';
 import type { ArchiveSource, SelectionItem } from '../types';
+import { isLibraryBundle } from '../media-type';
 import { reviewBand } from '../jev/service';
 import { JEV_QUESTIONS } from '../jev/taxonomy';
 import { CLIENTS_MAP, clientSlugForPath } from '../clients';
@@ -83,6 +84,7 @@ async function* walkAll(root: string, current = root): AsyncGenerator<WalkEntry>
   try { dir = await fs.opendir(current); } catch { return; }
   for await (const entry of dir) {
     if (entry.isDirectory() && SKIP_DIRS.has(entry.name)) continue;
+    if (entry.isDirectory() && isLibraryBundle(entry.name)) continue;
     if (entry.isDirectory() && entry.name === ORGANIZED_ROOT_NAME) {
       // Never re-walk the organizer's own output tree as source content to
       // organize, unless this walk's root is already inside it.
@@ -119,7 +121,7 @@ async function findProjectDirs(root: string): Promise<Set<string>> {
     }
 
     for (const entry of entries) {
-      if (entry.isDirectory() && !SKIP_DIRS.has(entry.name) && entry.name !== ORGANIZED_ROOT_NAME) {
+      if (entry.isDirectory() && !SKIP_DIRS.has(entry.name) && !isLibraryBundle(entry.name) && entry.name !== ORGANIZED_ROOT_NAME) {
         await walkDirs(path.join(current, entry.name));
       }
     }

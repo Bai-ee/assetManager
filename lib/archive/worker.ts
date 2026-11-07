@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'crypto';
 import { sha256File } from './hash';
 import { ArchiveDatabase } from './database';
 import type { ArchiveSource, CollectionJobRecord, FileLocationRecord, SelectionItem } from './types';
+import { isLibraryBundle } from './media-type';
 import { isFilesystemArtifact, isMovableExtension, ORGANIZED_ROOT_NAME } from './organize/scheme';
 
 // Re-exported for existing callers (`daemon.ts`) — canonical definitions now
@@ -22,6 +23,7 @@ async function* walk(root: string, current = root): AsyncGenerator<string> {
   const dir = await fs.opendir(current);
   for await (const entry of dir) {
     if (SKIP.has(entry.name)) continue;
+    if (entry.isDirectory() && isLibraryBundle(entry.name)) continue;
     if (entry.isDirectory() && entry.name === ORGANIZED_ROOT_NAME) {
       // Never re-discover the organizer's own output tree as source content,
       // unless this job's own root is already inside it (a correction
