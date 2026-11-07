@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { sha256File } from '../archive/hash';
 import type { Plan, PlanItem, Sidecar, SidecarChild, SidecarLocation, ChildRole } from './types';
+import { photolibHome } from './manifest';
 import type { AssetRow, Manifest } from './manifest';
 
 export const TIMELINE_ROOT = 'HITLOOP-ARCHIVE/timeline';
@@ -21,6 +22,8 @@ export interface ApplyOptions {
   now?: () => Date;
   /** Override for layout.ts sidecarPathFor (default `HITLOOP-ARCHIVE/timeline/_meta/<sha256>.json`). */
   sidecarPathFor?: (sha256: string) => string;
+  /** Exclusive lockfile path (default `${PHOTOLIB_HOME||~/.photolib}/apply.lock`); injectable for tests. */
+  lockPath?: string;
 }
 
 export interface ApplyResult {
@@ -41,8 +44,60 @@ export interface UndoResult {
   skipped: number;
   removedAssets: number;
   errors: { destPath: string; reason: string }[];
+  /** shas whose files were kept because other runs still reference them; only this run's locations were removed. */
+  keptShared: string[];
   /** true when `limit` stopped the undo before every journal row was processed. */
   partial: boolean;
+}
+
+const defaultLockPath = () => path.join(photolibHome(), 'apply.lock');
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === 'EPERM'; }
+}
+
+/** Exclusive apply/undo lock: O_EXCL create + pid; a lock whose pid is dead is replaced. Released in finally. */
+async function withApplyLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  let fd: number | null = null;
+  for (let attempt = 0; attempt < 2 && fd === null; attempt++) {
+    try {
+      fd = fs.openSync(lockPath, 'wx');
+    } catch (e: any) {
+      if (e?.code !== 'EEXIST') throw e;
+      let pid = NaN;
+      try { pid = parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10); } catch { /* vanished or unreadable */ }
+      if (Number.isFinite(pid) && pidAlive(pid)) throw new Error(`another photolib apply/undo is running (pid ${pid}); lock ${lockPath}`);
+      fs.rmSync(lockPath, { force: true }); // stale (dead pid or empty/garbled)
+    }
+  }
+  if (fd === null) throw new Error(`could not acquire photolib lock ${lockPath}`);
+  try {
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    return await fn();
+  } finally {
+    fs.rmSync(lockPath, { force: true });
+  }
+}
+
+const STALE_TMP_MS = 60 * 60 * 1000;
+
+/** Remove crashed-run `*.photolib-tmp-*` files older than 1h from the plan's destination dirs (timeline root only). */
+function sweepStaleTemps(plan: Plan, nowMs: number): void {
+  const dirs = new Set<string>();
+  const add = (rel: string) => { try { dirs.add(path.dirname(assertSafeDest(plan.destRoot, rel))); } catch { /* unsafe path: ignore */ } };
+  for (const pi of plan.items) { add(pi.canonicalPath); for (const c of pi.children) add(c.canonicalPath); }
+  add(defaultSidecarPath('x'));
+  for (const d of Array.from(dirs)) {
+    let names: string[];
+    try { names = fs.readdirSync(d); } catch { continue; }
+    for (const n of names) {
+      if (!/\.photolib-tmp-[0-9a-f]+$/.test(n)) continue;
+      const p = path.join(d, n);
+      try { const st = fs.statSync(p); if (st.isFile() && nowMs - st.mtimeMs > STALE_TMP_MS) fs.rmSync(p, { force: true }); } catch { /* best effort */ }
+    }
+  }
 }
 
 type CopyOutcome = 'created' | 'present' | 'conflict';
@@ -99,7 +154,7 @@ function buildSidecar(plan: Plan, pi: PlanItem, nowIso: string): Sidecar {
   const it = pi.item;
   const children: Partial<Record<ChildRole, SidecarChild>> = {};
   for (const c of pi.children) {
-    children[c.role] = { sha256: c.sha256, ext: extOf(c.canonicalPath), sizeBytes: c.file.sizeBytes, durationSec: null, canonicalPath: c.canonicalPath, sourceRelativePath: c.file.relativePath };
+    children[c.role] = { sha256: c.sha256, ext: extOf(c.canonicalPath), sizeBytes: c.file.sizeBytes, durationSec: c.durationSec ?? null, canonicalPath: c.canonicalPath, sourceRelativePath: c.file.relativePath };
   }
   return {
     schema: 'photolib.sidecar/1', sha256: pi.sha256, id: pi.sha256.slice(0, 16), kind: it.kind, ext: extOf(pi.canonicalPath), sizeBytes: it.sizeBytes,
@@ -107,7 +162,7 @@ function buildSidecar(plan: Plan, pi: PlanItem, nowIso: string): Sidecar {
     takenLocal: pi.date.takenLocal, tz: pi.date.tz, tzOffsetSec: pi.date.tzOffsetSec, tsUtc: pi.date.tsUtc, tsSource: pi.date.tsSource, tsKind: pi.date.tsKind,
     gps: it.lat != null && it.lon != null ? { lat: it.lat, lon: it.lon } : null,
     canonicalPath: pi.canonicalPath, albums: it.albums.slice(), favorite: it.favorite, hidden: it.hidden,
-    title: it.title, description: it.description, keywords: it.keywords.slice(), camera: null, children,
+    title: it.title, description: it.description, keywords: it.keywords.slice(), camera: pi.camera ?? null, children,
     locations: [locationOf(plan, pi)], createdAt: nowIso, updatedAt: nowIso,
   };
 }
@@ -146,7 +201,11 @@ export function newRunId(now = new Date()): string {
   return `run-${now.toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${crypto.randomBytes(2).toString('hex')}`;
 }
 
-export async function applyPlan(plan: Plan, opts: ApplyOptions): Promise<ApplyResult> {
+export function applyPlan(plan: Plan, opts: ApplyOptions): Promise<ApplyResult> {
+  return withApplyLock(opts.lockPath ?? defaultLockPath(), () => applyPlanLocked(plan, opts));
+}
+
+async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyResult> {
   const { manifest } = opts;
   const hashFile = opts.hashFile ?? sha256File;
   const now = opts.now ?? (() => new Date());
@@ -165,16 +224,22 @@ export async function applyPlan(plan: Plan, opts: ApplyOptions): Promise<ApplyRe
   const journal = (sha256: string, role: string, destPath: string, sizeBytes: number) =>
     manifest.journal({ runId, sha256, role, destPath, sizeBytes, at: now().toISOString() });
 
-  for (const pi of items) {
-    if (opts.isCancelled?.()) { res.cancelled = true; break; }
-    const rel = pi.item.relativePath;
-    try {
-      await applyItem(pi, rel);
-    } catch (e) {
-      res.errors.push({ relativePath: rel, reason: (e as Error).message });
+  try {
+    sweepStaleTemps(plan, now().getTime());
+    for (const pi of items) {
+      if (opts.isCancelled?.()) { res.cancelled = true; break; }
+      const rel = pi.item.relativePath;
+      try {
+        await applyItem(pi, rel);
+      } catch (e) {
+        res.errors.push({ relativePath: rel, reason: (e as Error).message });
+      }
+      done++;
+      opts.onProgress?.({ done, total: items.length, bytes: res.bytes });
     }
-    done++;
-    opts.onProgress?.({ done, total: items.length, bytes: res.bytes });
+  } catch (e) {
+    manifest.finishRun(runId, 'failed', { planId: plan.planId, locations: plan.items.map(pi => `${plan.sourceId}\u0000${pi.item.relativePath}`), error: (e as Error).message, copied: res.copied, present: res.present, duplicate: res.duplicate, conflict: res.conflict, children: res.children, bytes: res.bytes, errors: res.errors.length });
+    throw e;
   }
 
   async function applyItem(pi: PlanItem, relSrc: string): Promise<void> {
@@ -225,7 +290,7 @@ export async function applyPlan(plan: Plan, opts: ApplyOptions): Promise<ApplyRe
         if (co === 'created') { journal(c.sha256, c.role, c.canonicalPath, c.file.sizeBytes); res.children++; res.bytes += c.file.sizeBytes; }
         if (co === 'conflict') { res.errors.push({ relativePath: c.file.relativePath, reason: `conflict: ${c.canonicalPath} holds a different file` }); continue; }
         ok.push(c);
-        manifest.upsertChild({ parentSha: pi.sha256, role: c.role, sha256: c.sha256, ext: extOf(c.canonicalPath), sizeBytes: c.file.sizeBytes, durationSec: null, canonicalPath: c.canonicalPath, copiedAt: nowIso });
+        manifest.upsertChild({ parentSha: pi.sha256, role: c.role, sha256: c.sha256, ext: extOf(c.canonicalPath), sizeBytes: c.file.sizeBytes, durationSec: c.durationSec ?? null, canonicalPath: c.canonicalPath, copiedAt: nowIso });
       } catch (e) {
         res.errors.push({ relativePath: c.file.relativePath, reason: (e as Error).message });
       }
@@ -269,20 +334,70 @@ export async function applyPlan(plan: Plan, opts: ApplyOptions): Promise<ApplyRe
   return res;
 }
 
-export async function undoRun(runId: string, opts: { manifest: Manifest; destRoot: string; limit?: number; hashFile?: (p: string) => Promise<string> }): Promise<UndoResult> {
+export interface UndoOptions { manifest: Manifest; destRoot: string; limit?: number; hashFile?: (p: string) => Promise<string>; lockPath?: string }
+
+export function undoRun(runId: string, opts: UndoOptions): Promise<UndoResult> {
+  return withApplyLock(opts.lockPath ?? defaultLockPath(), () => undoRunLocked(runId, opts));
+}
+
+async function undoRunLocked(runId: string, opts: UndoOptions): Promise<UndoResult> {
   const { manifest, destRoot } = opts;
   const hashFile = opts.hashFile ?? sha256File;
-  const res: UndoResult = { runId, undone: 0, skipped: 0, removedAssets: 0, errors: [], partial: false };
+  const res: UndoResult = { runId, undone: 0, skipped: 0, removedAssets: 0, errors: [], keptShared: [], partial: false };
   const run = manifest.getRun(runId);
   let runLocs: Set<string> | null = null;
   try { const s = JSON.parse(run?.summaryJson ?? 'null'); if (Array.isArray(s?.locations)) runLocs = new Set<string>(s.locations); } catch { /* unknown */ }
 
   const rows = manifest.journalForRun(runId).filter(r => !r.undoneAt).reverse();
   const touchedDirs = new Set<string>();
+  const sharedShas = new Set<string>();
+  const keepPaths = new Set<string>(); // share-relative child paths belonging to a shared asset
+  const decided = new Map<string, boolean>();
+  const locKey = (l: { sourceId: string; relativePath: string }) => `${l.sourceId}\u0000${l.relativePath}`;
+
+  /**
+   * An asset is shared when its sidecar/manifest lists locations from outside this run. Then NONE of its files are removed:
+   * only this run's location rows (manifest + sidecar) go away.
+   */
+  function sharedFor(sha: string, sidecarRel: string): boolean {
+    const known = decided.get(sha);
+    if (known !== undefined) return known;
+    let shared = false;
+    if (runLocs) {
+      const asset = manifest.getAsset(sha);
+      const rel = asset?.sidecarPath ?? sidecarRel;
+      let abs: string | null = null;
+      try { abs = assertSafeDest(destRoot, rel); } catch { /* ignore */ }
+      const sc = abs ? readSidecar(abs) : null;
+      const others = (sc?.locations ?? []).some(l => !runLocs!.has(locKey(l))) || manifest.listLocations(sha).some(l => !runLocs!.has(locKey(l)));
+      if (others && (!sc || sc.sha256 === sha)) {
+        shared = true;
+        if (sc && abs) {
+          const kept: Sidecar = { ...sc, locations: sc.locations.filter(l => !runLocs!.has(locKey(l))), updatedAt: new Date().toISOString() };
+          writeJsonAtomic(abs, kept);
+          if (asset) manifest.upsertAsset({ ...asset, sidecarJson: JSON.stringify(kept), updatedAt: kept.updatedAt });
+        }
+        for (const l of manifest.listLocations(sha)) if (runLocs.has(locKey(l))) manifest.deleteLocation(l.sourceId, l.relativePath);
+        for (const c of manifest.listChildren(sha)) keepPaths.add(c.canonicalPath);
+        if (sc) for (const c of Object.values(sc.children)) if (c) keepPaths.add(c.canonicalPath);
+        sharedShas.add(sha);
+        res.keptShared.push(sha);
+        res.errors.push({ destPath: rel, reason: 'kept-shared: other runs still reference this asset; only this run\'s locations were removed' });
+      }
+    }
+    decided.set(sha, shared);
+    return shared;
+  }
+
   let processed = 0;
   for (const row of rows) {
     if (opts.limit && opts.limit > 0 && processed >= opts.limit) { res.partial = true; break; }
     processed++;
+    if (row.role === 'primary' || row.role === 'sidecar') sharedFor(row.sha256, row.role === 'sidecar' ? row.destPath : defaultSidecarPath(row.sha256));
+    if (((row.role === 'primary' || row.role === 'sidecar') && sharedShas.has(row.sha256)) || keepPaths.has(row.destPath)) {
+      manifest.markUndone(row.id); // handled: file intentionally kept
+      continue;
+    }
     let abs: string;
     try { abs = assertSafeDest(destRoot, row.destPath); } catch (e) { res.errors.push({ destPath: row.destPath, reason: (e as Error).message }); res.skipped++; continue; }
     const size = fileSize(abs);

@@ -148,10 +148,12 @@ export interface PlanItem {
   item: LibraryItem;
   date: ResolvedDate;
   canonicalPath: string; // share-root relative
+  /** Camera make/model from the primary's EXIF (null when absent). Optional for plans saved before this field existed. */
+  camera?: { make: string | null; model: string | null } | null;
   /** 'copy' = new; 'present' = canonical already exists with same sha (skip copy, still sidecar/manifest);
    *  'duplicate' = same sha as an earlier item in this plan/manifest (adds a location only); 'conflict' = canonical path taken by a different sha. */
   action: 'copy' | 'present' | 'duplicate' | 'conflict';
-  children: { role: ChildRole; sha256: string; file: ChildFile; canonicalPath: string; action: 'copy' | 'present' }[];
+  children: { role: ChildRole; sha256: string; file: ChildFile; canonicalPath: string; action: 'copy' | 'present'; /** EXIF duration of the child file (motion halves). */ durationSec?: number | null }[];
 }
 
 export interface Plan {

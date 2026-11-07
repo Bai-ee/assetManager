@@ -125,9 +125,13 @@ export class Manifest {
     return this.db.prepare('select * from locations where sha256 = ? order by source_id, relative_path').all(sha256).map(r => fromRow<LocationRow>(r));
   }
 
-  /** needsPush = never pushed OR no push_hash recorded; the push agent compares the hash itself. */
-  listAssets(opts: { missingThumbs?: boolean; needsPush?: boolean; limit?: number } = {}): AssetRow[] {
+  /**
+   * needsPush = never pushed OR no push_hash recorded (does NOT include already-pushed rows whose sidecar later changed;
+   * runPush uses withThumbs and compares push hashes itself). withThumbs = both thumbnails exist.
+   */
+  listAssets(opts: { missingThumbs?: boolean; needsPush?: boolean; withThumbs?: boolean; limit?: number } = {}): AssetRow[] {
     const w: string[] = [];
+    if (opts.withThumbs) w.push('(thumb_s is not null and thumb_m is not null)');
     if (opts.missingThumbs) w.push('(thumb_s is null or thumb_m is null)');
     if (opts.needsPush) w.push('(pushed_at is null or push_hash is null)');
     const sql = `select * from assets ${w.length ? 'where ' + w.join(' and ') : ''} order by taken_local, sha256 ${opts.limit ? 'limit ' + Math.floor(opts.limit) : ''}`;
@@ -175,6 +179,11 @@ export class Manifest {
   /** Removes the children row(s) for a child file (used by undo, which only knows the child's own sha + role). */
   deleteChildFile(sha256: string, role: string): void {
     this.db.prepare('delete from children where sha256 = ? and role = ?').run(sha256, role);
+  }
+
+  /** Removes one library location row (used by undo when the asset itself is kept). */
+  deleteLocation(sourceId: string, relativePath: string): void {
+    this.db.prepare('delete from locations where source_id = ? and relative_path = ?').run(sourceId, relativePath);
   }
 
   /** Removes the asset row plus its children and locations. */

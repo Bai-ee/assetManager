@@ -8,6 +8,7 @@ Boundary: `lib/photolib` may import `lib/archive`, never the reverse (same rule 
 - Library bundles + NAS originals are READ-ONLY. Never write/rename/delete inside a `.photoslibrary`, `iPhoto Library`, `.photolibrary`, `.migratedphotolibrary`.
 - Library DB (+ `-wal`/`-shm`) is copied to a temp dir and opened there (`inspect.ts openLibrary` pattern). Never open the in-bundle DB.
 - Copy only: `<dest>.photolib-tmp-<rand>` → fsync-less `rename`; verify size AND sha256 of the destination before rename; never overwrite an existing file.
+- `apply` and `undo` hold an exclusive `${PHOTOLIB_HOME||~/.photolib}/apply.lock` (pid; dead pid = stale). Residual risk: on SMB shares without hard links the final exists-check-then-rename is not atomic, so a non-photolib writer creating the same path in that instant could be overwritten.
 - Dates never from file mtime / birthtime / import date.
 - Personal scope: nothing here touches x_content_packages, timeline_entries, buckets, Brain.
 

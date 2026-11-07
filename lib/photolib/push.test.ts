@@ -83,7 +83,7 @@ test('runPush: uploads 2 thumbs per item, posts results, marks pushed', async ()
   assert.equal(item.thumbs.s, `life-thumbs/${item.id}_s.jpg`);
   assert.equal(m.pushed.length, 2);
   assert.equal(m.pushed[0][1], pushHashOf(item));
-  assert.equal((fakeManifest as any).last.needsPush, true);
+  assert.equal((fakeManifest as any).last.withThumbs, true);
 });
 
 test('runPush: chunks at 100 items / 200 urls', async () => {
@@ -108,7 +108,7 @@ test('runPush: unchanged rows skipped unless force; rows without thumbs ignored'
   const m = fakeManifest([rowFor(1, hash)]);
   const r2 = await runPush({ manifest: m, client: b.client, source: SRC, force: true, fetchImpl, sleep: noSleep });
   assert.equal(r2.pushed, 1);
-  assert.equal((fakeManifest as any).last.needsPush, false);
+  assert.equal((fakeManifest as any).last.withThumbs, true);
 });
 
 test('runPush: server-skipped items are reported and not marked pushed; failures leave rows unmarked', async () => {
@@ -161,4 +161,45 @@ test('LifeClient: bearer + JSON, retries 503, throws status + body on failure', 
   assert.equal(seen[0].init.headers.authorization, 'Bearer tok');
   const bad = new LifeClient('https://h.example', 't', (async () => new Response('nope', { status: 401 })) as unknown as typeof fetch, noSleep);
   await assert.rejects(bad.results({ source: SRC, items: [] }), /401 nope/);
+});
+
+test('runPush: an already-pushed asset whose sidecar changed is re-sent; unchanged is not', async () => {
+  const sc = sidecar(1);
+  const thumbs = { s: `life-thumbs/${sc.id}_s.jpg`, m: `life-thumbs/${sc.id}_m.jpg` };
+  const oldHash = pushHashOf(toLifeItem(sc, thumbs));
+  const changed = sidecar(1, { locations: [...sc.locations, { ...sc.locations[0], relativePath: 'Masters/b.jpg' }] });
+  const row = { ...rowFor(1, oldHash), sidecarJson: JSON.stringify(changed) };
+  const fetchImpl = (async () => new Response('', { status: 200 })) as unknown as typeof fetch;
+  const a = fakeClient(); const m = fakeManifest([row]);
+  const r = await runPush({ manifest: m, client: a.client, source: SRC, fetchImpl, sleep: noSleep });
+  assert.equal(r.pushed, 1);
+  assert.equal(a.calls.results[0].items[0].locations.length, 2);
+  assert.notEqual(m.pushed[0][1], oldHash);
+});
+
+test('toLifeItem truncates to server caps', () => {
+  const loc = (i: number) => ({ sourceId: 's'.repeat(100), libraryKind: 'photos' as const, libraryPath: 'L', relativePath: `Masters/${i}.jpg`, masterUuid: null, versionUuid: null, originalFileName: 'f'.repeat(400) });
+  const sc = sidecar(1, {
+    title: 't'.repeat(500), description: 'd'.repeat(3000), albums: Array.from({ length: 150 }, (_, i) => `a${i}`.padEnd(300, 'x')),
+    keywords: Array.from({ length: 300 }, (_, i) => `k${i}`), camera: { make: 'm'.repeat(200), model: null }, locations: Array.from({ length: 60 }, (_, i) => loc(i)),
+  });
+  const it = toLifeItem(sc, null);
+  assert.equal(it.title!.length, 300); assert.equal(it.description!.length, 2000);
+  assert.equal(it.albums.length, 100); assert.ok(it.albums.every(a => a.length <= 200));
+  assert.equal(it.keywords.length, 200);
+  assert.equal(it.camera!.make!.length, 100);
+  assert.equal(it.locations.length, 50);
+  assert.equal(it.locations[0].sourceId.length, 80); assert.equal(it.locations[0].originalFileName.length, 300);
+});
+
+test('runPush: item is only sent/marked when BOTH thumb PUTs succeed', async () => {
+  const rows = [rowFor(1), rowFor(2)];
+  const bad = rows[0].id;
+  const fetchImpl = (async (url: string) => new Response('', { status: url.includes(`${bad}/m`) ? 403 : 200 })) as unknown as typeof fetch;
+  const a = fakeClient(); const m = fakeManifest(rows);
+  const r = await runPush({ manifest: m, client: a.client, source: SRC, fetchImpl, sleep: noSleep });
+  assert.equal(r.pushed, 1);
+  assert.deepEqual(a.calls.results[0].items.map((i: any) => i.id), [rows[1].id]);
+  assert.deepEqual(m.pushed.map(p => p[0]), [rows[1].sha256]);
+  assert.equal(r.errors.length, 1); assert.equal(r.errors[0].id, bad);
 });

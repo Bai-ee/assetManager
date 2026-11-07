@@ -7,6 +7,7 @@ import { buildPlan, savePlan, loadPlan } from './plan';
 import { applyPlan } from './apply';
 import { makeFixture, sha, tmpDir } from './test-fixtures';
 
+process.env.PHOTOLIB_HOME = tmpDir(); // apply.lock lives here, never in the real ~/.photolib
 const open = () => new Manifest(path.join(tmpDir(), 'm.sqlite'));
 
 test('plan: classifies copy / duplicate / present / conflict, library path share-relative', async () => {
@@ -56,5 +57,29 @@ test('plan: children classified, limit, and cached hashes avoid re-hashing', asy
   assert.equal(p2.items[0].action, 'present');
   assert.equal(p2.items[0].children[0].action, 'present');
   assert.equal(calls.filter(c => c.startsWith(fx.libAbs)).length, 0, 'library files not re-hashed after apply');
+  m.close();
+});
+
+test('plan: carries EXIF camera, motion child duration, and falls back to EXIF video duration', async () => {
+  const fx = makeFixture([{ rel: 'Masters/v.MOV', content: 'VID', motion: { rel: 'resources/m.mov', content: 'MOV' } }]);
+  const base = { dateTimeOriginal: null, offsetTimeOriginal: null, gpsDateTimeUtc: null, quicktimeCreationDate: null, quicktimeCreateDateUtc: null, lat: null, lon: null, contentIdentifier: null, width: null, height: null };
+  const item = fx.items[0];
+  const deps = {
+    ...fx.deps,
+    readExifBatch: async (paths: string[]) => new Map(paths.map(p => [p, p === item.absPath
+      ? { ...base, make: 'Apple', model: 'iPhone 8', durationSec: 12.5 }
+      : { ...base, make: null, model: null, durationSec: 1.5 }])),
+  };
+  const m = open();
+  const p = await buildPlan({ libraryPath: fx.libAbs, destRoot: fx.root, sourceId: 'photos-test', manifest: m, deps });
+  assert.deepEqual(p.items[0].camera, { make: 'Apple', model: 'iPhone 8' });
+  assert.equal(p.items[0].item.durationSec, 12.5);
+  assert.equal(p.items[0].children[0].durationSec, 1.5);
+  await applyPlan(p, { manifest: m });
+  const sc = JSON.parse(m.getAsset(sha('VID'))!.sidecarJson);
+  assert.deepEqual(sc.camera, { make: 'Apple', model: 'iPhone 8' });
+  assert.equal(sc.durationSec, 12.5);
+  assert.equal(sc.children.motion.durationSec, 1.5);
+  assert.equal(m.listChildren(sha('VID'))[0].durationSec, 1.5);
   m.close();
 });

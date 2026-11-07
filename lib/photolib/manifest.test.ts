@@ -33,6 +33,7 @@ test('manifest: WAL, assets, hash cache, thumbs/push listing, journal, cascade d
   assert.equal(m.listAssets({ needsPush: true }).length, 2);
   m.markPushed('aa', 'h1');
   assert.deepEqual(m.listAssets({ needsPush: true }).map(a => a.sha256), ['bb']);
+  assert.equal(m.listAssets({ withThumbs: true }).map(a => a.sha256).join(), 'aa', 'withThumbs includes pushed rows with both thumbs');
   assert.equal(m.listAssets({ limit: 1 }).length, 1);
 
   m.startRun({ runId: 'r1', sourceId: 's', command: 'apply' });

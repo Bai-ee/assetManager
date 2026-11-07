@@ -8,6 +8,7 @@ import { applyPlan, undoRun } from './apply';
 import { makeFixture, listFiles, sha, snapshotTree, tmpDir, type Fixture } from './test-fixtures';
 import type { Plan, Sidecar } from './types';
 
+process.env.PHOTOLIB_HOME = tmpDir(); // default apply.lock lives here, never in the real ~/.photolib
 const open = () => new Manifest(path.join(tmpDir(), 'm.sqlite'));
 const plan = (fx: Fixture, m: Manifest, limit?: number): Promise<Plan> =>
   buildPlan({ libraryPath: fx.libAbs, destRoot: fx.root, sourceId: 'photos-test', manifest: m, deps: fx.deps, limit });
@@ -142,5 +143,73 @@ test('undo: sidecar with locations from another source is kept', async () => {
   const u = await undoRun(r.runId, { manifest: m, destRoot: fx.root });
   assert.ok(fs.existsSync(sp));
   assert.ok(u.errors.some(e => e.destPath.includes('_meta')));
+  m.close();
+});
+
+test('undo: asset shared with another run is kept; only this run\'s location is removed', async () => {
+  const fxA = makeFixture([{ rel: 'Masters/a.JPG', content: 'XXX' }]);
+  const m = open();
+  const rA = await applyPlan(await plan(fxA, m), { manifest: m });
+  // run B: a second library location for the same bytes
+  const planB = await buildPlan({ libraryPath: fxA.libAbs, destRoot: fxA.root, sourceId: 'photos-other', manifest: m, deps: { ...fxA.deps, readLibrary: (lp) => ({ kind: 'photos', libraryPath: lp, warnings: [], items: [{ ...fxA.items[0], sourceId: 'photos-other', relativePath: 'Masters/b-copy.JPG', masterUuid: 'mB' }] }) } });
+  assert.equal(planB.items[0].action, 'present');
+  const rB = await applyPlan(planB, { manifest: m });
+  assert.equal(rB.present, 1);
+
+  const primary = path.join(fxA.root, m.getAsset(sha('XXX'))!.canonicalPath);
+  const u = await undoRun(rA.runId, { manifest: m, destRoot: fxA.root });
+  assert.deepEqual(u.keptShared, [sha('XXX')]);
+  assert.equal(u.removedAssets, 0);
+  assert.ok(fs.existsSync(primary), 'primary kept');
+  const sc = sidecarOf(fxA, 'XXX');
+  assert.deepEqual(sc.locations.map(l => `${l.sourceId}:${l.relativePath}`), ['photos-other:Masters/b-copy.JPG']);
+  assert.ok(m.getAsset(sha('XXX')), 'manifest asset kept');
+  assert.deepEqual(m.listLocations(sha('XXX')).map(l => l.sourceId), ['photos-other']);
+  assert.deepEqual(JSON.parse(m.getAsset(sha('XXX'))!.sidecarJson).locations.length, 1);
+  m.close();
+});
+
+test('apply/undo: exclusive lockfile; live pid blocks, stale pid is replaced, released after run', async () => {
+  const fx = makeFixture([{ rel: 'Masters/a.JPG', content: 'AAA' }]);
+  const m = open();
+  const p = await plan(fx, m);
+  const lockPath = path.join(tmpDir(), 'apply.lock');
+  fs.writeFileSync(lockPath, String(process.pid));
+  await assert.rejects(applyPlan(p, { manifest: m, lockPath }), /another photolib apply\/undo is running/);
+  await assert.rejects(undoRun('nope', { manifest: m, destRoot: fx.root, lockPath }), /another photolib apply\/undo is running/);
+  assert.ok(fs.existsSync(lockPath), 'foreign lock untouched');
+  fs.writeFileSync(lockPath, '999999999'); // dead pid
+  const r = await applyPlan(p, { manifest: m, lockPath });
+  assert.equal(r.copied, 1);
+  assert.ok(!fs.existsSync(lockPath), 'lock released');
+  await undoRun(r.runId, { manifest: m, destRoot: fx.root, lockPath });
+  assert.ok(!fs.existsSync(lockPath));
+  m.close();
+});
+
+test('apply: stale photolib-tmp files (>1h) in destination dirs are swept; fresh and unrelated files stay', async () => {
+  const fx = makeFixture([{ rel: 'Masters/a.JPG', content: 'AAA' }]);
+  const m = open();
+  const p = await plan(fx, m);
+  const dir = path.dirname(path.join(fx.root, p.items[0].canonicalPath));
+  fs.mkdirSync(dir, { recursive: true });
+  const old = path.join(dir, 'x.jpg.photolib-tmp-deadbeef'), fresh = path.join(dir, 'y.jpg.photolib-tmp-cafebabe'), other = path.join(dir, 'keep.txt.tmp');
+  for (const f of [old, fresh, other]) fs.writeFileSync(f, 'z');
+  const t = new Date(Date.now() - 2 * 3600 * 1000);
+  fs.utimesSync(old, t, t); fs.utimesSync(other, t, t);
+  await applyPlan(p, { manifest: m });
+  assert.ok(!fs.existsSync(old)); assert.ok(fs.existsSync(fresh)); assert.ok(fs.existsSync(other));
+  m.close();
+});
+
+test('apply: a throw outside the per-item loop marks the run failed and rethrows', async () => {
+  const fx = makeFixture([{ rel: 'Masters/a.JPG', content: 'AAA' }]);
+  const m = open();
+  let runId = '';
+  const orig = m.startRun.bind(m);
+  m.startRun = (r) => { runId = r.runId; orig(r); };
+  await assert.rejects(applyPlan(await plan(fx, m), { manifest: m, onProgress: () => { throw new Error('boom'); } }), /boom/);
+  assert.equal(m.getRun(runId)?.state, 'failed');
+  assert.ok(JSON.parse(m.getRun(runId)!.summaryJson!).locations.length === 1, 'locations kept so undo still works');
   m.close();
 });

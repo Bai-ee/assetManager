@@ -76,7 +76,9 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
     childShas.push(cs);
   }
 
-  const exifMap = await deps.readExifBatch(items.map(i => i.absPath));
+  const exifPaths = items.map(i => i.absPath);
+  for (const it of items) { if (it.motion) exifPaths.push(it.motion.absPath); }
+  const exifMap = await deps.readExifBatch(exifPaths);
   opts.onProgress?.({ phase: 'exif', done: items.length, total: items.length });
 
   const destSize = (rel: string): number | null => {
@@ -99,7 +101,8 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
     if (failed.has(i)) continue;
     const item = items[i];
     const sha = shas[i];
-    const date = deps.resolveTakenDate(item, exifMap.get(item.absPath) ?? null);
+    const exif = exifMap.get(item.absPath) ?? null;
+    const date = deps.resolveTakenDate(item, exif);
     const ext = deps.normalizeExt(item.originalFileName);
     const canonicalPath = deps.canonicalPathFor(date, sha, ext);
     let action: PlanItem['action'];
@@ -124,14 +127,17 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
         const cpath = deps.canonicalPathFor(date, sha, deps.normalizeExt(path.basename(file.absPath)), role);
         const cp = await probe(cpath, csha, file.sizeBytes);
         if (cp === 'different') warnings.push({ masterUuid: item.masterUuid, relativePath: file.relativePath, reason: `child destination ${cpath} holds a different file` });
-        children.push({ role, sha256: csha, file, canonicalPath: cpath, action: cp === 'same' ? 'present' : 'copy' });
+        children.push({ role, sha256: csha, file, canonicalPath: cpath, action: cp === 'same' ? 'present' : 'copy', durationSec: exifMap.get(file.absPath)?.durationSec ?? null });
       }
     }
 
     totals.items++; totals[action]++;
     if (action === 'copy') totals.bytes += item.sizeBytes;
     for (const c of children) { totals.children++; if (c.action === 'copy') totals.bytes += c.file.sizeBytes; }
-    out.push({ sha256: sha, item, date, canonicalPath, action, children });
+    const camera = exif && (exif.make || exif.model) ? { make: exif.make, model: exif.model } : null;
+    // Library row duration wins; EXIF fills the gap for videos the library did not measure.
+    const planned = item.durationSec == null && exif?.durationSec != null ? { ...item, durationSec: exif.durationSec } : item;
+    out.push({ sha256: sha, item: planned, date, canonicalPath, action, camera, children });
     opts.onProgress?.({ phase: 'classify', done: i + 1, total: items.length });
   }
 

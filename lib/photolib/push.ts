@@ -10,6 +10,11 @@ export const MAX_ITEMS_PER_RESULTS = 100; // 2 urls per item → 200 urls per up
 const REQUEST_TIMEOUT_MS = 60_000;
 const TRIES = 3;
 
+// Server caps (HITLOOP features/life-timeline/schema.js): oversize items are rejected, so truncate deterministically here.
+const clip = (v: string, max: number): string => v.trim().slice(0, max);
+const clipOrNull = (v: string | null, max: number): string | null => (v == null ? null : clip(v, max));
+const clipList = (a: string[], maxItems: number, maxLen: number): string[] => a.map(x => clip(x, maxLen)).filter(Boolean).slice(0, maxItems);
+
 export function toLifeItem(sidecar: Sidecar, thumbs: { s: string; m: string } | null): LifeItem {
   const motion = sidecar.children.motion;
   const edited = sidecar.children.edited;
@@ -27,18 +32,18 @@ export function toLifeItem(sidecar: Sidecar, thumbs: { s: string; m: string } | 
     tsSource: sidecar.tsSource,
     tsKind: sidecar.tsKind,
     gps: sidecar.gps,
-    albums: sidecar.albums,
+    albums: clipList(sidecar.albums, 100, 200),
     favorite: sidecar.favorite,
     hidden: sidecar.hidden,
-    title: sidecar.title,
-    description: sidecar.description,
-    keywords: sidecar.keywords,
-    camera: sidecar.camera,
+    title: clipOrNull(sidecar.title, 300),
+    description: clipOrNull(sidecar.description, 2000),
+    keywords: clipList(sidecar.keywords, 200, 200),
+    camera: sidecar.camera ? { make: clipOrNull(sidecar.camera.make, 100), model: clipOrNull(sidecar.camera.model, 100) } : null,
     motion: motion ? { sha256: motion.sha256, durationSec: motion.durationSec } : null,
     edited: edited ? { sha256: edited.sha256 } : null,
     thumbs: thumbs ? { s: thumbs.s, m: thumbs.m } : null,
     canonicalPath: sidecar.canonicalPath,
-    locations: sidecar.locations.map(l => ({ sourceId: l.sourceId, relativePath: l.relativePath, originalFileName: l.originalFileName })),
+    locations: sidecar.locations.slice(0, 50).map(l => ({ sourceId: clip(l.sourceId, 80), relativePath: l.relativePath, originalFileName: clip(l.originalFileName, 300) })),
   };
 }
 
@@ -104,7 +109,7 @@ interface AssetRow { sha256: string; id: string; sidecarJson: string; thumbS: st
 
 export interface PushRunOpts {
   manifest: {
-    listAssets(o: { needsPush?: boolean; limit?: number }): unknown;
+    listAssets(o: { withThumbs?: boolean }): unknown;
     markPushed(sha256: string, pushHash: string): unknown;
   };
   client: Pick<LifeClient, 'uploadUrls' | 'results'>;
@@ -127,7 +132,7 @@ export interface PushRunResult {
 export async function runPush(o: PushRunOpts): Promise<PushRunResult> {
   const fetchImpl = o.fetchImpl ?? fetch;
   const sleep = o.sleep ?? realSleep;
-  const rows = ((await o.manifest.listAssets({ needsPush: !o.force, limit: o.limit })) as AssetRow[]).filter(r => r.thumbS && r.thumbM);
+  const rows = ((await o.manifest.listAssets({ withThumbs: true })) as AssetRow[]).filter(r => r.thumbS && r.thumbM);
   const res: PushRunResult = { pushed: 0, skipped: [], uploaded: 0, errors: [] };
 
   const prepared: { row: AssetRow; item: LifeItem; hash: string }[] = [];
@@ -138,6 +143,7 @@ export async function runPush(o: PushRunOpts): Promise<PushRunResult> {
       const hash = pushHashOf(item);
       if (!o.force && hash === r.pushHash) continue;
       prepared.push({ row: r, item, hash });
+      if (o.limit && o.limit > 0 && prepared.length >= o.limit) break;
     } catch (e) {
       res.errors.push({ id: r.id, error: `bad sidecar: ${e instanceof Error ? e.message : String(e)}` });
     }
@@ -147,6 +153,7 @@ export async function runPush(o: PushRunOpts): Promise<PushRunResult> {
   for (let i = 0; i < prepared.length; i += MAX_ITEMS_PER_RESULTS) {
     if (o.isCancelled?.()) { res.cancelled = true; break; }
     const chunk = prepared.slice(i, i + MAX_ITEMS_PER_RESULTS);
+    const sendable: typeof chunk = [];
     try {
       const reqs: UploadUrlRequest[] = [];
       for (const c of chunk) {
@@ -154,27 +161,43 @@ export async function runPush(o: PushRunOpts): Promise<PushRunResult> {
         reqs.push({ sha256: c.item.sha256, variant: 'm', contentType: 'image/jpeg', sizeBytes: statSync(c.row.thumbM as string).size });
       }
       const grants = await o.client.uploadUrls(reqs);
+      // An item is only pushed when BOTH of its thumbnails were PUT successfully.
+      const okVariants = new Map<string, Set<string>>();
+      const putErrors = new Map<string, string>();
       for (const g of grants) {
         const c = chunk.find(x => x.item.sha256 === g.sha256);
-        if (!c) continue;
-        const file = readFileSync((g.variant === 's' ? c.row.thumbS : c.row.thumbM) as string);
-        await withRetry(async () => {
-          const r = await fetchImpl(g.uploadUrl, { method: 'PUT', headers: { ...g.headers, 'content-length': String(file.length) }, body: file, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-          if (!r.ok) throw new HttpError(r.status, `thumb PUT failed: ${r.status}`);
-        }, sleep);
-        res.uploaded++;
+        if (!c || putErrors.has(g.sha256)) continue;
+        try {
+          const file = readFileSync((g.variant === 's' ? c.row.thumbS : c.row.thumbM) as string);
+          await withRetry(async () => {
+            const r = await fetchImpl(g.uploadUrl, { method: 'PUT', headers: { ...g.headers, 'content-length': String(file.length) }, body: file, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+            if (!r.ok) throw new HttpError(r.status, `thumb PUT failed: ${r.status}`);
+          }, sleep);
+          res.uploaded++;
+          const set = okVariants.get(g.sha256) ?? new Set<string>();
+          set.add(g.variant); okVariants.set(g.sha256, set);
+        } catch (e) {
+          putErrors.set(g.sha256, `thumb ${g.variant} upload failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
-      const out = await o.client.results({ source: o.source, items: chunk.map(c => c.item) });
+      for (const c of chunk) {
+        const v = okVariants.get(c.item.sha256);
+        if (v?.has('s') && v.has('m')) sendable.push(c);
+        else res.errors.push({ id: c.item.id, error: putErrors.get(c.item.sha256) ?? 'thumb upload incomplete (missing upload grant)' });
+      }
+      if (sendable.length === 0) { seen += chunk.length; o.onProgress?.({ done: seen, total: prepared.length }); continue; }
+      const out = await o.client.results({ source: o.source, items: sendable.map(c => c.item) });
       const skippedIds = new Set((out.skipped ?? []).map(s => s.id));
       for (const s of out.skipped ?? []) res.skipped.push({ id: s.id, reason: s.reason });
-      for (const c of chunk) {
+      for (const c of sendable) {
         if (skippedIds.has(c.item.id)) continue;
         await o.manifest.markPushed(c.item.sha256, c.hash);
         res.pushed++;
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      for (const c of chunk) res.errors.push({ id: c.item.id, error: msg });
+      const reported = new Set(res.errors.map(e => e.id));
+      for (const c of chunk) if (!reported.has(c.item.id)) res.errors.push({ id: c.item.id, error: msg });
     }
     seen += chunk.length;
     o.onProgress?.({ done: seen, total: prepared.length });
