@@ -25,6 +25,13 @@ export interface FolderReadOptions {
   log?: (msg: string) => void;
   minBytes?: number;
   batchSize?: number;
+  /** Owner rule for loose folders: keep only files whose EXIF names a phone/camera (not a Mac). Default: env PHOTOLIB_CAMERA_ONLY=1. */
+  cameraOnly?: boolean;
+}
+
+/** True when the EXIF camera model is a capture device (phone/camera), not a Mac (screen recordings, exports). */
+export function isCameraModel(model: string | null | undefined): boolean {
+  return !!model && !/^Mac|iMac/i.test(model);
 }
 
 const toPosix = (p: string) => p.split(path.sep).join('/');
@@ -44,6 +51,8 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
   const log = opts.log ?? (() => undefined);
   const minBytes = opts.minBytes ?? MIN_BYTES;
   const batchSize = opts.batchSize ?? EXIF_BATCH;
+  const cameraOnly = opts.cameraOnly ?? process.env.PHOTOLIB_CAMERA_ONLY === '1';
+  let skippedNotCamera = 0;
 
   // 1. Walk (explicit stack; tolerate per-directory errors).
   const candidates: Candidate[] = [];
@@ -86,7 +95,9 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
       const exif = m.get(c.abs) ?? null;
       const date = opts.resolveTakenDate({ imageDateUtc: null, tzOffsetSec: null }, exif);
       all.set(c.abs, { exif, date });
-      if (date.tsKind !== 'unknown') dated.set(c.abs, { exif, date });
+      if (date.tsKind === 'unknown') continue;
+      if (cameraOnly && !isCameraModel(exif?.model)) { skippedNotCamera++; continue; }
+      dated.set(c.abs, { exif, date });
     }
     log(`  exif ${Math.min(i + batchSize, candidates.length)}/${candidates.length}`);
   }
@@ -118,6 +129,7 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
     if (consumed.has(c.abs)) { exif.set(c.abs, all.get(c.abs)?.exif ?? null); continue; }
     const d = dated.get(c.abs);
     if (!d) {
+      if (all.get(c.abs)?.date.tsKind !== 'unknown') continue; // dated but not a camera capture (counted above)
       skippedNoDate++;
       if (unknownExamples.length < MAX_WARNED_EXAMPLES) unknownExamples.push(c.rel);
       continue;
@@ -140,6 +152,7 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
   if (skippedNoDate) {
     warnings.push({ reason: `${skippedNoDate} file(s) skipped: no capture-date metadata (never falls back to file time). Examples: ${unknownExamples.join(', ')}` });
   }
+  if (skippedNotCamera) warnings.push({ reason: `${skippedNotCamera} dated file(s) skipped: camera-only (no phone/camera model in EXIF)` });
   if (tooSmall) warnings.push({ reason: `${tooSmall} file(s) skipped: under ${minBytes} bytes` });
   return { kind: 'folder', libraryPath: root, items, warnings, exif, skippedNoDate };
 }

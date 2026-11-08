@@ -58,6 +58,23 @@ test('folder: skips undated, tiny, bundles, hidden, AppleDouble, symlinks; reads
   assert.ok(r.warnings.some(w => /no capture-date/.test(w.reason) && /a\/undated\.jpg/.test(w.reason)));
 });
 
+test('folder: cameraOnly keeps phone/camera captures, drops Mac/none before hashing, not counted as undated', async () => {
+  const { root, readExifBatch } = build({
+    'a/phone.jpg': { tag: 'ph', exif: { ...D('2020:01:02 03:04:05'), model: 'iPhone XR' } },
+    'a/canon.jpg': { tag: 'cn', exif: { ...D('2015:01:02 03:04:05'), model: 'Canon PowerShot S110' } },
+    'a/screen.mov': { tag: 'sr', exif: { ...D('2026:01:02 03:04:05'), model: 'Mac16,5' } },
+    'a/export.mp4': { tag: 'ex', exif: D('2021:01:02 03:04:05') },
+    'a/old.mov': { tag: 'mb', exif: { ...D('2019:01:02 03:04:05'), model: 'MacBookPro11,4' } },
+    'a/undated.jpg': { tag: 'nd' },
+  });
+  const r = await readFolder(root, { sourceId: 'folder-t', readExifBatch, resolveTakenDate, cameraOnly: true });
+  assert.deepEqual(r.items.map(i => i.relativePath), ['a/canon.jpg', 'a/phone.jpg']);
+  assert.equal(r.skippedNoDate, 1);
+  assert.ok(r.warnings.some(w => /3 dated file\(s\) skipped: camera-only/.test(w.reason)));
+  const all = await readFolder(root, { sourceId: 'folder-t', readExifBatch, resolveTakenDate, cameraOnly: false });
+  assert.equal(all.items.length, 5);
+});
+
 test('folder: live pair becomes motion child; unrelated video stays its own item', async () => {
   const { root, readExifBatch } = build({
     'pics/IMG_1.HEIC': { tag: 'img', exif: { ...D('2020:01:02 03:04:05'), contentIdentifier: 'CID-1' } },
