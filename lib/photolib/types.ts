@@ -122,8 +122,22 @@ export interface Sidecar {
   camera: { make: string | null; model: string | null } | null;
   children: Partial<Record<ChildRole, SidecarChild>>;
   locations: SidecarLocation[];
+  /** Full-metadata files in _meta/ (metadata.ts). Optional: assets ingested before 2026-11-08 have none. Never pushed. */
+  meta?: SidecarMeta;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Share-relative paths of the complete metadata captured for an asset (and its children, keyed by role). */
+export interface SidecarMeta {
+  /** Full exiftool dump of the primary file. */
+  exif: string | null;
+  /** Byte copies of source XMP sidecars. */
+  xmp: string[];
+  /** Source Photos-library records (one per source). */
+  library: string[];
+  /** Child files' (motion/edited) own captures. */
+  children?: Partial<Record<ChildRole, { exif: string | null; xmp: string[] }>>;
 }
 
 export interface SidecarChild {

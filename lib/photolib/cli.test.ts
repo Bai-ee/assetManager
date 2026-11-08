@@ -4,7 +4,7 @@ import { assertDestRootSafe, assertLibrary, deriveSourceId, libraryKindOf, parse
 
 test('parseArgs: command, flags, defaults', () => {
   const a = parseArgs(['apply', '--library', '/Volumes/bryan/D/L.photoslibrary', '--limit', '25', '--force', '--json', '--plan', 'plan-1', '--source-id', 'x', '--run', 'r1', '--dest-root', '/Volumes/other']);
-  assert.deepEqual(a, { command: 'apply', library: '/Volumes/bryan/D/L.photoslibrary', destRoot: '/Volumes/other', sourceId: 'x', limit: 25, plan: 'plan-1', run: 'r1', force: true, json: true });
+  assert.deepEqual(a, { command: 'apply', library: '/Volumes/bryan/D/L.photoslibrary', destRoot: '/Volumes/other', sourceId: 'x', limit: 25, plan: 'plan-1', run: 'r1', force: true, json: true, mode: 'copy' });
   const d = parseArgs(['status']);
   assert.equal(d.destRoot, '/Volumes/bryan'); assert.equal(d.force, false); assert.equal(d.json, false);
 });
@@ -16,6 +16,10 @@ test('parseArgs rejects bad input', () => {
   assert.throws(() => parseArgs(['plan', '--library']), /needs a value/);
   assert.throws(() => parseArgs(['plan', '--library', '--json']), /needs a value/);
   assert.throws(() => parseArgs(['plan', '--wat']), /Unknown argument/);
+  assert.throws(() => parseArgs(['apply', '--mode', 'delete']), /copy or move/);
+  assert.throws(() => parseArgs(['plan', '--mode', 'move']), /only apply to the apply command/);
+  assert.throws(() => parseArgs(['apply', '--photos-db', 'rel/Photos.sqlite']), /absolute/);
+  assert.equal(parseArgs(['apply', '--mode', 'move', '--photos-db', '/t/Photos.sqlite']).mode, 'move');
 });
 
 test('libraryKindOf / slug', () => {

@@ -105,7 +105,9 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
   // 3. Live Photo pairing: same dir + same basename (case-insensitive) + equal non-null contentIdentifier.
   const byDirBase = new Map<string, Candidate[]>();
   for (const c of candidates) {
-    const key = `${path.dirname(c.rel)}\0${path.basename(c.rel, path.extname(c.rel)).toLowerCase()}`;
+    // icloudpd's default live-photo policy names the video half "<name>_HEVC.MOV"; pair it with "<name>.HEIC" too.
+    const stem = path.basename(c.rel, path.extname(c.rel)).toLowerCase().replace(/_hevc$/, '');
+    const key = `${path.dirname(c.rel)}\0${stem}`;
     (byDirBase.get(key) ?? byDirBase.set(key, []).get(key)!).push(c);
   }
   const motionOf = new Map<string, Candidate>(); // image abs -> video candidate

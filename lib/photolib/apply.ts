@@ -1,13 +1,17 @@
 /**
- * APPLY / UNDO (docs/archive/PHOTOLIB.md). Copy-only, never overwrites, every created file is journaled.
- * Sources (library bundles) are only ever read.
+ * APPLY / UNDO (docs/archive/PHOTOLIB.md). Never overwrites, every created/moved/deleted file is journaled.
+ * Default mode 'copy': sources (library bundles) are only ever read.
+ * Mode 'move' (folder sources on the same share only, e.g. bryan/iCloud-Photos): full metadata is captured first, then
+ * new files are renamed into the timeline and verified; raw copies of files already on the timeline are deleted only
+ * after BOTH the timeline file and the raw file re-hash to the same sha256. Undo moves files back / restores raw copies.
  */
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pipeline } from 'stream/promises';
 import { sha256File } from '../archive/hash';
-import type { Plan, PlanItem, Sidecar, SidecarChild, SidecarLocation, ChildRole } from './types';
+import type { Plan, PlanItem, Sidecar, SidecarChild, SidecarLocation, SidecarMeta, ChildRole } from './types';
+import type { MetaFile } from './metadata';
 import { photolibHome } from './manifest';
 import type { AssetRow, Manifest } from './manifest';
 
@@ -25,6 +29,10 @@ export interface ApplyOptions {
   sidecarPathFor?: (sha256: string) => string;
   /** Exclusive lockfile path (default `${PHOTOLIB_HOME||~/.photolib}/apply.lock`); injectable for tests. */
   lockPath?: string;
+  /** 'copy' (default) or 'move' (folder sources inside destRoot only; requires captureMeta). */
+  mode?: 'copy' | 'move';
+  /** Full-metadata capture (metadata.ts captureMetadata). Runs before any move/delete; a failure skips the item untouched. */
+  captureMeta?: (f: MetaFile) => Promise<SidecarMeta>;
 }
 
 export interface ApplyResult {
@@ -37,6 +45,14 @@ export interface ApplyResult {
   bytes: number;
   errors: { relativePath: string; reason: string }[];
   cancelled?: boolean;
+  /** Move mode: files renamed into the timeline. */
+  moved?: number;
+  /** Move mode: raw copies deleted because a verified identical file is on the timeline. */
+  rawDeleted?: number;
+  /** Move mode: raw files left in place (duplicate's Live Photo half, verify failure, …). */
+  rawKept?: number;
+  /** Files whose full metadata was captured this run. */
+  metaCaptured?: number;
 }
 
 export interface UndoResult {
@@ -49,6 +65,8 @@ export interface UndoResult {
   keptShared: string[];
   /** true when `limit` stopped the undo before every journal row was processed. */
   partial: boolean;
+  /** Move-mode rows reversed: files moved back to the raw folder + deleted raw copies restored. */
+  restored?: number;
 }
 
 const defaultLockPath = () => path.join(photolibHome(), 'apply.lock');
@@ -177,6 +195,48 @@ async function copyVerified(src: string, dest: string, sha: string, hashFile: (p
   }
 }
 
+/**
+ * Same-share rename src -> dest, then verify dest size + sha. Never overwrites (dest checked first; single writer under
+ * the apply lock). A failed verify renames the file back. Cross-device renames fail (EXDEV) instead of copying.
+ */
+async function moveVerified(src: string, dest: string, sha: string, size: number, hashFile: (p: string) => Promise<string>): Promise<CopyOutcome> {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  if (exists(dest)) return fileSize(dest) === size && (await hashFile(dest)) === sha ? 'present' : 'conflict';
+  if (fileSize(src) !== size) throw new Error('source size changed since plan');
+  fs.renameSync(src, dest);
+  if (fileSize(dest) !== size || (await hashFile(dest)) !== sha) {
+    if (!exists(src)) fs.renameSync(dest, src);
+    throw new Error('moved file failed sha256 verify; moved back');
+  }
+  return 'created';
+}
+
+/**
+ * Delete a raw duplicate only after the kept timeline file AND the raw file both re-hash to sha. Returns false (raw kept)
+ * when anything does not check out.
+ */
+async function deleteVerifiedRaw(rawAbs: string, keptAbs: string, sha: string, size: number, hashFile: (p: string) => Promise<string>): Promise<boolean> {
+  if (path.resolve(rawAbs) === path.resolve(keptAbs)) return false;
+  if (fileSize(keptAbs) !== size || fileSize(rawAbs) !== size) return false;
+  if ((await hashFile(keptAbs)) !== sha) return false;
+  if ((await hashFile(rawAbs)) !== sha) return false;
+  fs.unlinkSync(rawAbs);
+  return true;
+}
+
+function mergeMeta(a: SidecarMeta | undefined, b: SidecarMeta | undefined): SidecarMeta | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const children: SidecarMeta['children'] = { ...(b.children ?? {}) };
+  for (const [role, c] of Object.entries(a.children ?? {})) {
+    const o = children[role as ChildRole];
+    if (c) children[role as ChildRole] = o ? { exif: c.exif ?? o.exif, xmp: union(c.xmp, o.xmp) } : c;
+  }
+  const out: SidecarMeta = { exif: a.exif ?? b.exif, xmp: union(a.xmp, b.xmp), library: union(a.library, b.library) };
+  if (Object.keys(children).length) out.children = children;
+  return out;
+}
+
 function writeJsonAtomic(file: string, data: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.photolib-tmp-${rand()}`;
@@ -224,6 +284,7 @@ function mergeSidecar(old: Sidecar, inc: Sidecar): Sidecar {
     camera: old.camera ?? inc.camera, gps: old.gps ?? inc.gps,
     children: { ...inc.children, ...old.children },
     locations: locs, createdAt: old.createdAt,
+    ...(old.meta || inc.meta ? { meta: mergeMeta(old.meta, inc.meta) } : {}),
   };
 }
 
@@ -252,6 +313,17 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
   const sidecarPathFor = opts.sidecarPathFor ?? defaultSidecarPath;
   const runId = newRunId(now());
   const res: ApplyResult = { runId, copied: 0, present: 0, duplicate: 0, conflict: 0, children: 0, bytes: 0, errors: [] };
+  const move = opts.mode === 'move';
+  if (move) {
+    if (plan.libraryKind !== 'folder') throw new Error('move mode is only allowed for folder sources (never library bundles)');
+    if (!opts.captureMeta) throw new Error('move mode requires metadata capture (captureMeta)');
+    if (!plan.libraryPath || plan.libraryPath.startsWith('..') || path.isAbsolute(plan.libraryPath)) throw new Error('move mode: source folder must be inside destRoot');
+    if (plan.libraryPath === TIMELINE_ROOT || plan.libraryPath.startsWith('HITLOOP-ARCHIVE')) throw new Error('move mode: source folder must not be inside HITLOOP-ARCHIVE');
+    Object.assign(res, { moved: 0, rawDeleted: 0, rawKept: 0 });
+  }
+  if (opts.captureMeta) res.metaCaptured = 0;
+  /** Share-relative path of a source file (folder sources live inside destRoot). */
+  const srcRel = (relSrc: string) => path.posix.join(plan.libraryPath, relSrc);
 
   manifest.upsertSource({ id: plan.sourceId, kind: plan.libraryKind, libraryPath: plan.libraryPath, label: null, addedAt: now().toISOString() });
   manifest.startRun({
@@ -261,8 +333,8 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
 
   const items = opts.limit && opts.limit > 0 ? plan.items.slice(0, opts.limit) : plan.items;
   let done = 0;
-  const journal = (sha256: string, role: string, destPath: string, sizeBytes: number) =>
-    manifest.journal({ runId, sha256, role, destPath, sizeBytes, at: now().toISOString() });
+  const journal = (sha256: string, role: string, destPath: string, sizeBytes: number, srcPath?: string) =>
+    manifest.journal({ runId, sha256, role, destPath, sizeBytes, at: now().toISOString(), srcPath: srcPath ?? null });
 
   try {
     sweepStaleTemps(plan, now().getTime());
@@ -292,6 +364,18 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
     const incoming = buildSidecar(plan, pi, nowIso);
     const prev = manifest.getAsset(pi.sha256);
 
+    // ---- full metadata first: nothing is moved or deleted unless its metadata is saved ----
+    if (opts.captureMeta) {
+      const meta = await opts.captureMeta({ sha256: pi.sha256, absPath: pi.item.absPath, relativePath: relSrc, sizeBytes: pi.item.sizeBytes });
+      const kids: NonNullable<SidecarMeta['children']> = {};
+      for (const c of pi.children) {
+        const cm = await opts.captureMeta({ sha256: c.sha256, absPath: c.file.absPath, relativePath: c.file.relativePath, sizeBytes: c.file.sizeBytes });
+        kids[c.role] = { exif: cm.exif, xmp: cm.xmp };
+      }
+      incoming.meta = Object.keys(kids).length ? { ...meta, children: kids } : meta;
+      res.metaCaptured = (res.metaCaptured ?? 0) + 1 + pi.children.length;
+    }
+
     if (pi.action === 'duplicate') {
       const prevPath = prev ? assertSafeDest(plan.destRoot, prev.canonicalPath) : null;
       if (!prev || fileSize(prevPath!) !== prev.sizeBytes) throw new Error('duplicate target not present (its first copy did not complete)');
@@ -299,6 +383,8 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
       incoming.children = {};
       await persistSidecar(old, incoming, prev.sidecarPath, prev, false);
       res.duplicate++;
+      if (move) await dropRaw(pi.item.absPath, relSrc, prevPath!, prev.canonicalPath, pi.sha256, pi.item.sizeBytes);
+      if (move && (pi.item.motion || pi.item.edited)) res.rawKept! += (pi.item.motion ? 1 : 0) + (pi.item.edited ? 1 : 0); // duplicate's children are not planned
       return;
     }
 
@@ -311,12 +397,18 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
       if (sz !== pi.item.sizeBytes) outcome = 'conflict';
       else if (prev?.verifiedAt && prev.canonicalPath === destRel && prev.sizeBytes === sz) outcome = 'present'; // resumable fast path
       else outcome = (await hashFile(destAbs)) === pi.sha256 ? 'present' : 'conflict';
+    } else if (move) {
+      outcome = await moveVerified(pi.item.absPath, destAbs, pi.sha256, pi.item.sizeBytes, hashFile);
+      if (outcome === 'created') { journal(pi.sha256, 'primary', destRel, pi.item.sizeBytes, srcRel(relSrc)); res.copied++; res.moved!++; res.bytes += pi.item.sizeBytes; }
     } else {
       outcome = await copyVerified(pi.item.absPath, destAbs, pi.sha256, hashFile);
       if (outcome === 'created') { journal(pi.sha256, 'primary', destRel, pi.item.sizeBytes); res.copied++; res.bytes += pi.item.sizeBytes; }
     }
     if (outcome === 'conflict') { res.conflict++; res.errors.push({ relativePath: relSrc, reason: `conflict: ${destRel} holds a different file` }); return; }
-    if (outcome === 'present') res.present++;
+    if (outcome === 'present') {
+      res.present++;
+      if (move) await dropRaw(pi.item.absPath, relSrc, destAbs, destRel, pi.sha256, pi.item.sizeBytes);
+    }
 
     // ---- children ----
     const ok: PlanItem['children'] = [];
@@ -326,9 +418,10 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
         const csz = fileSize(cAbs);
         let co: CopyOutcome;
         if (csz !== null) co = csz === c.file.sizeBytes && (await hashFile(cAbs)) === c.sha256 ? 'present' : 'conflict';
-        else co = await copyVerified(c.file.absPath, cAbs, c.sha256, hashFile);
-        if (co === 'created') { journal(c.sha256, c.role, c.canonicalPath, c.file.sizeBytes); res.children++; res.bytes += c.file.sizeBytes; }
-        if (co === 'conflict') { res.errors.push({ relativePath: c.file.relativePath, reason: `conflict: ${c.canonicalPath} holds a different file` }); continue; }
+        else co = move ? await moveVerified(c.file.absPath, cAbs, c.sha256, c.file.sizeBytes, hashFile) : await copyVerified(c.file.absPath, cAbs, c.sha256, hashFile);
+        if (co === 'created') { journal(c.sha256, c.role, c.canonicalPath, c.file.sizeBytes, move ? srcRel(c.file.relativePath) : undefined); res.children++; res.bytes += c.file.sizeBytes; if (move) res.moved!++; }
+        if (co === 'conflict') { if (move) res.rawKept!++; res.errors.push({ relativePath: c.file.relativePath, reason: `conflict: ${c.canonicalPath} holds a different file` }); continue; }
+        if (co === 'present' && move) await dropRaw(c.file.absPath, c.file.relativePath, cAbs, c.canonicalPath, c.sha256, c.file.sizeBytes);
         ok.push(c);
         manifest.upsertChild({ parentSha: pi.sha256, role: c.role, sha256: c.sha256, ext: extOf(c.canonicalPath), sizeBytes: c.file.sizeBytes, durationSec: c.durationSec ?? null, canonicalPath: c.canonicalPath, copiedAt: nowIso });
       } catch (e) {
@@ -339,6 +432,17 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
 
     const old = readSidecar(sidecarAbs);
     await persistSidecar(old, incoming, sidecarRel, prev, true);
+  }
+
+  /** Move mode: delete a raw duplicate after double verification, journaled so undo can restore it from the kept copy. */
+  async function dropRaw(rawAbs: string, relSrc: string, keptAbs: string, keptRel: string, sha: string, size: number): Promise<void> {
+    if (await deleteVerifiedRaw(rawAbs, keptAbs, sha, size, hashFile)) {
+      journal(sha, 'raw-deleted', keptRel, size, srcRel(relSrc));
+      res.rawDeleted!++;
+    } else {
+      res.rawKept!++;
+      res.errors.push({ relativePath: relSrc, reason: 'raw duplicate kept: verify did not match' });
+    }
   }
 
   /** Merge + write the sidecar (only when content changes), journal it if newly created, then upsert manifest rows. */
@@ -370,6 +474,7 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
     planId: plan.planId,
     locations: plan.items.map(pi => `${plan.sourceId}\u0000${pi.item.relativePath}`),
     copied: res.copied, present: res.present, duplicate: res.duplicate, conflict: res.conflict, children: res.children, bytes: res.bytes, errors: res.errors.length,
+    ...(move ? { mode: 'move', moved: res.moved, rawDeleted: res.rawDeleted, rawKept: res.rawKept } : {}), metaCaptured: res.metaCaptured,
   });
   return res;
 }
@@ -383,7 +488,26 @@ export function undoRun(runId: string, opts: UndoOptions): Promise<UndoResult> {
 async function undoRunLocked(runId: string, opts: UndoOptions): Promise<UndoResult> {
   const { manifest, destRoot } = opts;
   const hashFile = opts.hashFile ?? sha256File;
-  const res: UndoResult = { runId, undone: 0, skipped: 0, removedAssets: 0, errors: [], keptShared: [], partial: false };
+  const res: UndoResult = { runId, undone: 0, skipped: 0, removedAssets: 0, errors: [], keptShared: [], partial: false, restored: 0 };
+  /** Absolute raw-folder path of a move-mode row; never inside the timeline. */
+  const rawAbsOf = (srcPath: string): string => {
+    const norm = path.posix.normalize(srcPath);
+    if (path.isAbsolute(srcPath) || norm.startsWith('..') || norm.startsWith('HITLOOP-ARCHIVE')) throw new Error(`unsafe source path: ${srcPath}`);
+    return path.join(destRoot, norm);
+  };
+  /** Put a verified copy of keptAbs back at the raw path (used for deleted raw duplicates and shared moved files). */
+  const restoreCopy = async (keptAbs: string, rawAbs: string, sha: string): Promise<void> => {
+    if (exists(rawAbs)) return; // already back
+    if ((await hashFile(keptAbs)) !== sha) throw new Error('kept file no longer matches; raw copy not restored');
+    fs.mkdirSync(path.dirname(rawAbs), { recursive: true });
+    const tmp = `${rawAbs}.photolib-tmp-${rand()}`;
+    try {
+      await streamCopyExclusive(keptAbs, tmp);
+      if ((await hashFile(tmp)) !== sha) throw new Error('restored copy sha256 mismatch');
+      if (exists(rawAbs)) return;
+      fs.renameSync(tmp, rawAbs);
+    } finally { fs.rmSync(tmp, { force: true }); }
+  };
   const run = manifest.getRun(runId);
   let runLocs: Set<string> | null = null;
   try { const s = JSON.parse(run?.summaryJson ?? 'null'); if (Array.isArray(s?.locations)) runLocs = new Set<string>(s.locations); } catch { /* unknown */ }
@@ -433,8 +557,19 @@ async function undoRunLocked(runId: string, opts: UndoOptions): Promise<UndoResu
   for (const row of rows) {
     if (opts.limit && opts.limit > 0 && processed >= opts.limit) { res.partial = true; break; }
     processed++;
+    if (row.role === 'raw-deleted') {
+      try {
+        await restoreCopy(assertSafeDest(destRoot, row.destPath), rawAbsOf(row.srcPath!), row.sha256);
+        manifest.markUndone(row.id); res.restored!++;
+      } catch (e) { res.skipped++; res.errors.push({ destPath: row.srcPath!, reason: (e as Error).message }); }
+      continue;
+    }
     if (row.role === 'primary' || row.role === 'sidecar') sharedFor(row.sha256, row.role === 'sidecar' ? row.destPath : defaultSidecarPath(row.sha256));
     if (((row.role === 'primary' || row.role === 'sidecar') && sharedShas.has(row.sha256)) || keepPaths.has(row.destPath)) {
+      if (row.srcPath) { // moved file that other runs also reference: keep it, put a copy back in the raw folder
+        try { await restoreCopy(assertSafeDest(destRoot, row.destPath), rawAbsOf(row.srcPath), row.sha256); res.restored!++; }
+        catch (e) { res.skipped++; res.errors.push({ destPath: row.srcPath, reason: (e as Error).message }); continue; }
+      }
       manifest.markUndone(row.id); // handled: file intentionally kept
       continue;
     }
@@ -450,7 +585,13 @@ async function undoRunLocked(runId: string, opts: UndoOptions): Promise<UndoResu
       } else if (size !== row.sizeBytes || (await hashFile(abs)) !== row.sha256) {
         res.skipped++; res.errors.push({ destPath: row.destPath, reason: 'file changed since the run; left in place' }); continue;
       }
-      fs.unlinkSync(abs);
+      if (row.srcPath) {
+        const rawAbs = rawAbsOf(row.srcPath);
+        if (exists(rawAbs)) { res.skipped++; res.errors.push({ destPath: row.destPath, reason: 'raw path is occupied; moved file left on the timeline' }); continue; }
+        fs.mkdirSync(path.dirname(rawAbs), { recursive: true });
+        fs.renameSync(abs, rawAbs); // move back (same share)
+        res.restored!++;
+      } else fs.unlinkSync(abs);
       touchedDirs.add(path.dirname(abs));
       manifest.markUndone(row.id);
       res.undone++;

@@ -30,7 +30,13 @@ export interface LocationRow {
 
 export interface RunRow { runId: string; sourceId: string; command: string; startedAt: string; finishedAt: string | null; state: string; summaryJson: string | null }
 
-export interface JournalRow { id: number; runId: string; sha256: string; role: string; destPath: string; sizeBytes: number; at: string; undoneAt: string | null }
+/**
+ * role: 'primary' | 'motion' | 'edited' | 'sidecar' (file created at destPath) |
+ * 'raw-deleted' (move mode: the source copy at srcPath was deleted after its identical file at destPath was verified).
+ * srcPath (share-relative) is set for move-mode rows: undo moves the file back / restores the raw copy there.
+ * Full-metadata files in _meta/ (metadata.ts) are not journaled: undo never removes captured metadata.
+ */
+export interface JournalRow { id: number; runId: string; sha256: string; role: string; destPath: string; sizeBytes: number; at: string; undoneAt: string | null; srcPath?: string | null }
 export type JournalEntry = Omit<JournalRow, 'id' | 'undoneAt'>;
 
 const SCHEMA = `
@@ -85,6 +91,8 @@ export class Manifest {
     this.db = new Database(this.filePath);
     this.db.pragma('journal_mode = WAL');
     this.db.exec(SCHEMA);
+    const journalCols = this.db.prepare(`select name from pragma_table_info('journal')`).all() as { name: string }[];
+    if (!journalCols.some(c => c.name === 'src_path')) this.db.exec('alter table journal add column src_path text');
   }
 
   upsertSource(src: SourceRow): void {
@@ -163,8 +171,8 @@ export class Manifest {
   }
 
   journal(e: JournalEntry): number {
-    return Number(this.db.prepare('insert into journal (run_id, sha256, role, dest_path, size_bytes, at) values (?, ?, ?, ?, ?, ?)')
-      .run(e.runId, e.sha256, e.role, e.destPath, e.sizeBytes, e.at).lastInsertRowid);
+    return Number(this.db.prepare('insert into journal (run_id, sha256, role, dest_path, size_bytes, at, src_path) values (?, ?, ?, ?, ?, ?, ?)')
+      .run(e.runId, e.sha256, e.role, e.destPath, e.sizeBytes, e.at, e.srcPath ?? null).lastInsertRowid);
   }
 
   /** All journal rows of a run (including undone), ascending id. */

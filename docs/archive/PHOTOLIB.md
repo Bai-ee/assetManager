@@ -7,7 +7,7 @@ Boundary: `lib/photolib` may import `lib/archive`, never the reverse (same rule 
 ## Hard rules
 - Library bundles + NAS originals are READ-ONLY. Never write/rename/delete inside a `.photoslibrary`, `iPhoto Library`, `.photolibrary`, `.migratedphotolibrary`.
 - Library DB (+ `-wal`/`-shm`) is copied to a temp dir and opened there (`inspect.ts openLibrary` pattern). Never open the in-bundle DB.
-- Copy only: `<dest>.photolib-tmp-<rand>` → fsync-less `rename`; verify size AND sha256 of the destination before rename; never overwrite an existing file.
+- Copy only (exception: CLI `apply --mode move` for folder sources inside the share, see "Full metadata + move mode"): `<dest>.photolib-tmp-<rand>` → fsync-less `rename`; verify size AND sha256 of the destination before rename; never overwrite an existing file.
 - `apply` and `undo` hold an exclusive `${PHOTOLIB_HOME||~/.photolib}/apply.lock` (pid; dead pid = stale). Residual risk: on SMB shares without hard links the final exists-check-then-rename is not atomic, so a non-photolib writer creating the same path in that instant could be overwritten.
 - Dates never from file mtime / birthtime / import date.
 - Personal scope: nothing here touches x_content_packages, timeline_entries, buckets, Brain.
@@ -94,3 +94,22 @@ JPEG, not WebP: this Mac's ffmpeg has no libwebp and `sips` cannot write WebP (2
 - Items: `masterUuid` = first 32 hex of sha256(relativePath), `versionUuid` null, no albums/title/keywords; `relativePath` is relative to the folder; `plan.libraryPath` = folder relative to dest root.
 - sourceId default `folder-<slug of folder path relative to dest root>` (`Dec10th MAc Backup` → `folder-dec10th-mac-backup`); source kind `folder`, label = the relative path.
 - Contract changes: `LibraryKind` gains `'folder'`; `ReadLibraryResult` gains optional `exif`, `skippedNoDate`; `Plan.totals` gains optional `skippedNoDate`; `PlanDeps.readLibrary` may be async. HITLOOP `source.kind` accepts `folder`.
+
+## Full metadata + move mode (`metadata.ts`, `apply --mode move`, 2026-11-08)
+Owner rule: **all metadata of every ingested file is saved before anything is moved or deleted.**
+- The CLI `apply` always captures, per file and per child (motion/edited), into `HITLOOP-ARCHIVE/timeline/_meta/`:
+  - `<sha>.exif.json`: the complete exiftool dump (`-a -G1 -s -u -ee -struct -n`, every group including MakerNotes, XMP, QuickTime and Composite). Location-only System tags are dropped because they change on move.
+  - `<sha>.<xmpSha8>.xmp`: byte copies of XMP sidecars found beside the source (`<file>.<ext>.xmp`, `<stem>.xmp`), for example from icloudpd `--xmp-sidecar`.
+  - `<sha>.library.<sourceId>.json`, with `--photos-db <Photos.sqlite>`. The DB is copied to a temp directory first. The file holds the full Photos record:
+    - every `ZASSET` and `ZADDITIONALASSETATTRIBUTES` column (blobs as base64)
+    - albums, keywords, caption, people, moment
+    - Matching is by original filename (icloudpd `-<size>` suffix stripped), original size and creation second (file mtime, matching only). An ambiguous match keeps every candidate.
+- The sidecar gains an optional `meta` (paths only), which is never pushed. `_meta` files are written once, never overwritten, and never removed by undo.
+- A capture failure skips the item and leaves it untouched.
+- **`--mode move`** works only for folder sources inside the share, outside `HITLOOP-ARCHIVE`. The dashboard plugin stays copy-only.
+  - New files are renamed into the timeline, then verified by size and sha256. On a mismatch the file is renamed back.
+  - When a raw file is already on the timeline (`present`/`duplicate`), its location and metadata are merged first. The raw file is deleted only after **both** the timeline file and the raw file re-hash to the same sha256.
+  - A duplicate's Live Photo or edited half is not planned, so it stays in the raw folder and is counted as `rawKept`.
+  - The journal records the share-relative source path in `journal.src_path` (an auto-migrated column), with role `raw-deleted` for deleted raw copies.
+- Undo of a move run moves files back to the raw folder and restores deleted raw copies by a verified copy from the kept timeline file. A shared asset is kept on the timeline, and a copy is put back.
+- Folder Live Photo pairing also accepts icloudpd's `<name>_HEVC.MOV`.

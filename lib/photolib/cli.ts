@@ -1,6 +1,8 @@
 /**
  * npm run photolib -- <plan|apply|undo|thumbs|push|status> (--library <abs bundle> | --folder <abs dir>) [--dest-root /Volumes/bryan] [--source-id id]
  *   [--limit N] [--plan <planId>] [--run <runId>] [--force] [--json]
+ *   apply also: [--mode copy|move] [--photos-db <Photos.sqlite>]  — full metadata (exiftool dump + XMP sidecars + optional
+ *   Photos-library record) is always captured to timeline/_meta before a file is copied, moved or a raw duplicate deleted.
  * Pure helpers are exported for tests; main() only runs when this file is executed directly.
  */
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -21,12 +23,16 @@ export interface CliArgs {
   run?: string;
   force: boolean;
   json: boolean;
+  /** apply: 'move' renames folder-source files into the timeline and deletes verified raw duplicates. */
+  mode: 'copy' | 'move';
+  /** apply: Photos.sqlite of the library the folder was downloaded from (copied to a temp dir before reading). */
+  photosDb?: string;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
   const [command, ...rest] = argv;
   if (!command || !(COMMANDS as readonly string[]).includes(command)) throw new Error(`Usage: photolib <${COMMANDS.join('|')}> [options] (got ${command ?? 'nothing'})`);
-  const out: CliArgs = { command: command as CliCommand, destRoot: DEFAULT_DEST_ROOT, force: false, json: false };
+  const out: CliArgs = { command: command as CliCommand, destRoot: DEFAULT_DEST_ROOT, force: false, json: false, mode: 'copy' };
   const value = (i: number, flag: string): string => {
     const v = rest[i + 1];
     if (v === undefined || v.startsWith('--')) throw new Error(`${flag} needs a value`);
@@ -46,12 +52,20 @@ export function parseArgs(argv: string[]): CliArgs {
         if (!Number.isInteger(n) || n < 1) throw new Error('--limit must be a positive whole number');
         out.limit = n; break;
       }
+      case '--mode': {
+        const m = value(i, a); i++;
+        if (m !== 'copy' && m !== 'move') throw new Error('--mode must be copy or move');
+        out.mode = m; break;
+      }
+      case '--photos-db': out.photosDb = value(i, a); i++; break;
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       default: throw new Error(`Unknown argument ${a}`);
     }
   }
   if (out.library && out.folder) throw new Error('--library and --folder are mutually exclusive');
+  if ((out.mode === 'move' || out.photosDb) && out.command !== 'apply') throw new Error('--mode / --photos-db only apply to the apply command');
+  if (out.photosDb && !isAbsolute(out.photosDb)) throw new Error('--photos-db must be an absolute path');
   return out;
 }
 
@@ -164,7 +178,13 @@ export async function main(argv: string[]): Promise<number> {
           plan = await deps.loadPlan(args.plan, home);
         } else plan = await planNow();
         if (cancelled) { result = { cancelled: true }; break; }
-        result = await deps.applyPlan(plan, { manifest, limit: args.limit, isCancelled, onProgress });
+        const [{ captureMetadata, openLibraryRecordIndex, copyPhotosDb }, { readFullExif }, os] = await Promise.all([import('./metadata'), import('./exif'), import('node:os')]);
+        const library = args.photosDb ? openLibraryRecordIndex(copyPhotosDb(args.photosDb, os.tmpdir())) : null;
+        try {
+          const destRoot = resolve(plan.destRoot);
+          const captureMeta = (f: Parameters<typeof captureMetadata>[1]) => captureMetadata(destRoot, f, { readFullExif, library, sourceId: plan.sourceId });
+          result = await deps.applyPlan(plan, { manifest, limit: args.limit, isCancelled, onProgress, mode: args.mode, captureMeta } as never);
+        } finally { library?.close(); }
         line(args, `apply ${JSON.stringify(result)}`);
         break;
       }

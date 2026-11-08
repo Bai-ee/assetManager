@@ -28,6 +28,15 @@ export async function readExif(absPath: string): Promise<ExifInfo> {
   return toExifInfo(tags as unknown as Record<string, unknown>);
 }
 
+/**
+ * Every tag exiftool can read, nothing curated: all groups (-G1, duplicates kept with -a), unknown tags (-u),
+ * embedded/timed data (-ee), structured XMP (-struct), numeric values (-n). Binary blobs come back as
+ * "(Binary data N bytes…)" placeholders; the original file itself is kept, so the bytes are never lost.
+ */
+export async function readFullExif(absPath: string): Promise<Record<string, unknown>> {
+  return (await tool().readRaw(absPath, { readArgs: ['-a', '-G1', '-s', '-u', '-ee', '-struct', '-n', '-api', 'largefilesupport=1'] })) as unknown as Record<string, unknown>;
+}
+
 export async function readExifBatch(paths: string[], opts?: { concurrency?: number }): Promise<Map<string, ExifInfo | null>> {
   const concurrency = Math.max(1, opts?.concurrency ?? 4);
   const out = new Map<string, ExifInfo | null>();
