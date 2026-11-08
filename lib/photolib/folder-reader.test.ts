@@ -130,7 +130,29 @@ test('cli: --folder parsing, source id, guards', () => {
   assert.throws(() => parseArgs(['plan', '--folder', '/a', '--library', '/b/x.photoslibrary']), /mutually exclusive/);
   assert.equal(deriveFolderSourceId('/Volumes/bryan/Dec10th MAc Backup', '/Volumes/bryan'), 'folder-dec10th-mac-backup');
   assert.equal(deriveFolderSourceId('/Volumes/bryan/Old Stuff/2012 Pics/', '/Volumes/bryan'), 'folder-old-stuff-2012-pics');
-  assert.throws(() => deriveFolderSourceId('/elsewhere/x', '/Volumes/bryan'), /inside --dest-root/);
+  assert.equal(deriveFolderSourceId('/elsewhere/x', '/Volumes/bryan'), 'ext-elsewhere-x', 'outside the share = external source (copy mode only)');
   assert.throws(() => assertFolder('rel/dir'), /absolute/);
   assert.throws(() => assertFolder('/x/Photos.photoslibrary'), /--library/);
+});
+
+test('folder: --files list plans only listed files (no walk), rejects paths outside root or inside bundles; external path label', async () => {
+  const dto = { dateTimeOriginal: '2019:12:11 19:16:24', model: 'iPhone XR' };
+  const { root, readExifBatch } = build({
+    'a/IMG_1.JPG': { tag: 'one', exif: dto },
+    'a/IMG_2.JPG': { tag: 'two', exif: dto },
+    'L.photoslibrary/originals/x.jpg': { tag: 'lib', exif: dto },
+    'a/IMG_3.CR3': { tag: 'raw', exif: { ...dto, model: 'Canon EOS R7' } },
+  });
+  const files = ['a/IMG_1.JPG', 'L.photoslibrary/originals/x.jpg', 'a/IMG_3.CR3'].map(r => path.join(root, r)).concat('/elsewhere/z.jpg');
+  const r = await readFolder(root, { sourceId: 'ext-t', readExifBatch, resolveTakenDate, files, cameraOnly: true });
+  assert.deepEqual(r.items.map(i => i.relativePath).sort(), ['a/IMG_1.JPG', 'a/IMG_3.CR3'], 'IMG_2 not listed; bundle + outside rejected; CR3 read');
+  assert.ok(r.warnings.some(w => /outside the folder root/.test(w.reason)));
+  assert.ok(r.warnings.some(w => /library bundle/.test(w.reason)));
+  const { sourceLibraryPath } = await import('./plan');
+  const { storedFolderPath } = await import('./cli');
+  assert.equal(sourceLibraryPath('/Volumes/bryan', '/Volumes/4TB - WMD/dl_june_20'), 'ext:4TB - WMD/dl_june_20');
+  assert.equal(storedFolderPath('/Volumes/bryan', '/Volumes/4TB - WMD/dl_june_20'), 'ext:4TB - WMD/dl_june_20');
+  assert.equal(sourceLibraryPath('/Volumes/bryan', '/Volumes/bryan/iCloud-Photos'), 'iCloud-Photos');
+  assert.equal(deriveFolderSourceId('/Volumes/4TB - WMD', '/Volumes/bryan'), 'ext-4tb-wmd');
+  assert.throws(() => parseArgs(['plan', '--files', '/t/x.txt']), /needs --folder/);
 });

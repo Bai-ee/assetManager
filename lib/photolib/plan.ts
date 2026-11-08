@@ -35,6 +35,16 @@ export interface BuildPlanOptions {
 
 const toPosix = (p: string) => p.split(path.sep).join('/');
 
+/**
+ * Share-relative library path, or for a source outside the share (an attached drive, copy mode only)
+ * "ext:<path below /Volumes>", e.g. "ext:4TB - WMD/dl_june_20". Provenance only; never resolved against destRoot.
+ */
+export function sourceLibraryPath(destRoot: string, libraryPath: string): string {
+  const rel = toPosix(path.relative(destRoot, libraryPath));
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+  return 'ext:' + toPosix(path.resolve(libraryPath)).replace(/^\/Volumes\//, '');
+}
+
 export function newPlanId(now = new Date()): string {
   const ts = now.toISOString().replace(/[-:T]/g, '').slice(0, 14);
   return `plan-${ts}-${crypto.randomBytes(2).toString('hex')}`;
@@ -149,7 +159,7 @@ export async function buildPlan(opts: BuildPlanOptions): Promise<Plan> {
     planId: newPlanId(now),
     sourceId,
     libraryKind: lib.kind,
-    libraryPath: toPosix(path.relative(destRoot, opts.libraryPath)),
+    libraryPath: sourceLibraryPath(destRoot, opts.libraryPath),
     destRoot,
     createdAt: now.toISOString(),
     items: out,

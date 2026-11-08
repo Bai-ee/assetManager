@@ -170,3 +170,12 @@ test('metadata: Photos.sqlite record lookup by name + size + date, every column 
   idx.close();
   assert.deepEqual(nameKeys('IMG_1-1234.HEIC'), ['img_1-1234.heic', 'img_1.heic']);
 });
+
+test('move: refused for an external (ext:) folder source', async () => {
+  const fx = folderFixture([{ rel: 'a.JPG', content: 'AAA' }]);
+  const m = open();
+  const p = { ...(await plan(fx, m)), libraryPath: 'ext:4TB - WMD/x' };
+  await assert.rejects(applyPlan(p, { manifest: m, mode: 'move', captureMeta: recorder().captureMeta }), /must be inside destRoot/);
+  assert.equal(fs.readFileSync(raw(fx, 'a.JPG'), 'utf8'), 'AAA');
+  m.close();
+});

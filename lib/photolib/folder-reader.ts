@@ -10,7 +10,7 @@ import * as path from 'path';
 import { isLibraryBundle } from '../archive/media-type';
 import type { ChildFile, ExifInfo, LibraryItem, MediaKind, ReadLibraryResult, ResolvedDate } from './types';
 
-export const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'heic', 'heif', 'png', 'gif', 'tif', 'tiff', 'cr2', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2']);
+export const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'heic', 'heif', 'png', 'gif', 'tif', 'tiff', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'raf', 'orf', 'rw2']);
 export const VIDEO_EXTS = new Set(['mov', 'mp4', 'm4v', 'avi', '3gp', 'mts']);
 export const MIN_BYTES = 10 * 1024;
 const EXIF_BATCH = 500;
@@ -27,6 +27,8 @@ export interface FolderReadOptions {
   batchSize?: number;
   /** Owner rule for loose folders: keep only files whose EXIF names a phone/camera (not a Mac). Default: env PHOTOLIB_CAMERA_ONLY=1. */
   cameraOnly?: boolean;
+  /** Explicit file list (absolute paths under root) instead of walking the tree, e.g. a survey's candidate list. */
+  files?: string[];
 }
 
 /** True when the EXIF camera model is a capture device (phone/camera), not a Mac (screen recordings, exports). */
@@ -57,7 +59,21 @@ export async function readFolder(root: string, opts: FolderReadOptions): Promise
   // 1. Walk (explicit stack; tolerate per-directory errors).
   const candidates: Candidate[] = [];
   let scanned = 0, tooSmall = 0;
-  const stack: string[] = [root];
+  const stack: string[] = opts.files ? [] : [root];
+  for (const abs of opts.files ?? []) {
+    const rel = toPosix(path.relative(root, abs));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) { warnings.push({ relativePath: abs, reason: 'listed file is outside the folder root' }); continue; }
+    if (rel.split('/').some(isSkippedName)) { warnings.push({ relativePath: rel, reason: 'listed file is inside a skipped directory or library bundle' }); continue; }
+    scanned++;
+    const ext = path.extname(abs).slice(1).toLowerCase();
+    const kind: MediaKind | null = IMAGE_EXTS.has(ext) ? 'image' : VIDEO_EXTS.has(ext) ? 'video' : null;
+    if (!kind) continue;
+    let size: number;
+    try { size = (await fs.promises.stat(abs)).size; }
+    catch (e) { warnings.push({ relativePath: rel, reason: `stat failed: ${(e as Error).message}` }); continue; }
+    if (size < minBytes) { tooSmall++; continue; }
+    candidates.push({ abs, rel, ext, size, kind });
+  }
   while (stack.length) {
     const dir = stack.pop() as string;
     let entries: fs.Dirent[];

@@ -317,7 +317,7 @@ async function applyPlanLocked(plan: Plan, opts: ApplyOptions): Promise<ApplyRes
   if (move) {
     if (plan.libraryKind !== 'folder') throw new Error('move mode is only allowed for folder sources (never library bundles)');
     if (!opts.captureMeta) throw new Error('move mode requires metadata capture (captureMeta)');
-    if (!plan.libraryPath || plan.libraryPath.startsWith('..') || path.isAbsolute(plan.libraryPath)) throw new Error('move mode: source folder must be inside destRoot');
+    if (!plan.libraryPath || plan.libraryPath.startsWith('..') || plan.libraryPath.startsWith('ext:') || path.isAbsolute(plan.libraryPath)) throw new Error('move mode: source folder must be inside destRoot');
     if (plan.libraryPath === TIMELINE_ROOT || plan.libraryPath.startsWith('HITLOOP-ARCHIVE')) throw new Error('move mode: source folder must not be inside HITLOOP-ARCHIVE');
     Object.assign(res, { moved: 0, rawDeleted: 0, rawKept: 0 });
   }

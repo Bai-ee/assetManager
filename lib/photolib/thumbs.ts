@@ -19,7 +19,8 @@ export type RunFn = (cmd: string, args: string[]) => Promise<void>;
 const defaultRun: RunFn = async (cmd, args) => { await execFileP(cmd, args, { maxBuffer: 16 * 1024 * 1024 }); };
 
 export const THUMB_SIZES = { s: { edge: 320, q: 4 }, m: { edge: 1600, q: 3 } } as const;
-const SIPS_FIRST = new Set(['.heic', '.heif', '.hif']);
+// HEIC + camera RAW: ffmpeg cannot decode them; sips (macOS RAW engine) converts to JPEG first.
+const SIPS_FIRST = new Set(['.heic', '.heif', '.hif', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2']);
 
 export interface ThumbOpts { cacheDir: string; ffmpegPath?: string; run?: RunFn }
 

@@ -1,10 +1,13 @@
 /**
  * npm run photolib -- <plan|apply|undo|thumbs|push|status> (--library <abs bundle> | --folder <abs dir>) [--dest-root /Volumes/bryan] [--source-id id]
  *   [--limit N] [--plan <planId>] [--run <runId>] [--force] [--json]
+ *   plan/apply with --folder also: [--files <txt of absolute paths>] (plan only those files). A --folder outside --dest-root
+ *   (an attached drive) is allowed in copy mode; its paths are recorded as "ext:<path below /Volumes>".
  *   apply also: [--mode copy|move] [--photos-db <Photos.sqlite>]  — full metadata (exiftool dump + XMP sidecars + optional
  *   Photos-library record) is always captured to timeline/_meta before a file is copied, moved or a raw duplicate deleted.
  * Pure helpers are exported for tests; main() only runs when this file is executed directly.
  */
+import { readFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { LibraryKind } from './types';
 
@@ -27,6 +30,8 @@ export interface CliArgs {
   mode: 'copy' | 'move';
   /** apply: Photos.sqlite of the library the folder was downloaded from (copied to a temp dir before reading). */
   photosDb?: string;
+  /** plan/apply --folder: text file of absolute paths to plan instead of walking the folder. */
+  files?: string;
 }
 
 export function parseArgs(argv: string[]): CliArgs {
@@ -58,6 +63,7 @@ export function parseArgs(argv: string[]): CliArgs {
         out.mode = m; break;
       }
       case '--photos-db': out.photosDb = value(i, a); i++; break;
+      case '--files': out.files = value(i, a); i++; break;
       case '--force': out.force = true; break;
       case '--json': out.json = true; break;
       default: throw new Error(`Unknown argument ${a}`);
@@ -66,6 +72,7 @@ export function parseArgs(argv: string[]): CliArgs {
   if (out.library && out.folder) throw new Error('--library and --folder are mutually exclusive');
   if ((out.mode === 'move' || out.photosDb) && out.command !== 'apply') throw new Error('--mode / --photos-db only apply to the apply command');
   if (out.photosDb && !isAbsolute(out.photosDb)) throw new Error('--photos-db must be an absolute path');
+  if (out.files && !out.folder) throw new Error('--files needs --folder (the root the listed files sit under)');
   return out;
 }
 
@@ -93,11 +100,16 @@ export function deriveSourceId(libraryPath: string): string {
   return `iphoto-${slug(basename(basename(abs) === 'iPhoto Library' ? dirname(parent) : parent))}`;
 }
 
-/** Folder source id: folder-<slug of the folder path relative to the dest root, segments joined with '-'>. */
+/** Folder source id: folder-<slug of the share-relative path>, or ext-<slug of the path below /Volumes> for an attached drive. */
 export function deriveFolderSourceId(folderPath: string, destRoot: string): string {
   const rel = shareRelative(destRoot, folderPath);
-  if (rel === null) throw new Error('--folder must be inside --dest-root (paths are stored share-relative)');
+  if (rel === null) return `ext-${slug(resolve(folderPath).replace(/^\/Volumes\//, '').split(sep).join(' '))}`;
   return `folder-${slug(rel.split('/').join(' '))}`;
+}
+
+/** Stored library path: share-relative, or "ext:<path below /Volumes>" for a folder on an attached drive (copy mode only). */
+export function storedFolderPath(destRoot: string, folderPath: string): string {
+  return shareRelative(destRoot, folderPath) ?? 'ext:' + resolve(folderPath).replace(/^\/Volumes\//, '').split(sep).join('/');
 }
 
 /** Throws unless the path is an absolute directory path (not a library bundle — use --library for those). */
@@ -160,11 +172,12 @@ export async function main(argv: string[]): Promise<number> {
       const library = needLibrary();
       const destRoot = assertDestRootSafe(args.destRoot, library);
       const sourceId = sourceIdFor(library, destRoot);
-      const rel = shareRelative(destRoot, library);
-      if (rel === null) throw new Error(`${isFolder ? '--folder' : '--library'} must be inside --dest-root (paths are stored share-relative)`);
+      const rel = isFolder ? storedFolderPath(destRoot, library) : shareRelative(destRoot, library);
+      if (rel === null) throw new Error('--library must be inside --dest-root (paths are stored share-relative)');
+      const files = args.files ? readFileSync(args.files, 'utf8').split('\n').map(l => l.trim()).filter(Boolean) : undefined;
       (manifest as { upsertSource?: (s: unknown) => void }).upsertSource?.({ id: sourceId, kind: isFolder ? 'folder' : libraryKindOf(library), libraryPath: rel, label: isFolder ? rel : basename(dirname(library)), addedAt: new Date().toISOString() });
       line(args, `plan ${sourceId} ← ${library}`);
-      const plan = await deps.buildPlan({ libraryPath: library, destRoot, sourceId, limit: args.limit, manifest, onProgress, folder: isFolder, log: args.json ? undefined : (m: string) => console.error(m) });
+      const plan = await deps.buildPlan({ libraryPath: library, destRoot, sourceId, limit: args.limit, manifest, onProgress, folder: isFolder, files, log: args.json ? undefined : (m: string) => console.error(m) });
       await deps.savePlan(plan, home);
       line(args, `planId ${plan.planId}  ${JSON.stringify(plan.totals)}  warnings ${plan.warnings.length}`);
       return plan;
@@ -204,8 +217,8 @@ export async function main(argv: string[]): Promise<number> {
       case 'push': {
         const library = needLibrary();
         const destRoot = assertDestRootSafe(args.destRoot, library);
-        const rel = shareRelative(destRoot, library);
-        if (rel === null) throw new Error(`${isFolder ? '--folder' : '--library'} must be inside --dest-root (paths are pushed share-relative)`);
+        const rel = isFolder ? storedFolderPath(destRoot, library) : shareRelative(destRoot, library);
+        if (rel === null) throw new Error('--library must be inside --dest-root (paths are pushed share-relative)');
         const sourceId = sourceIdFor(library, destRoot);
         result = await deps.runPush({
           manifest, limit: args.limit, force: args.force, isCancelled, onProgress,

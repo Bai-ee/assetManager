@@ -27,7 +27,7 @@ export interface ManifestLike {
 
 export interface PhotolibDeps {
   openManifest(): ManifestLike | Promise<ManifestLike>;
-  buildPlan(o: { libraryPath: string; destRoot: string; sourceId: string; limit?: number; manifest: ManifestLike; onProgress?: (p: Progress) => void; /** Plain-directory source (CLI --folder) instead of a library bundle. */ folder?: boolean; log?: (msg: string) => void }): Promise<Plan>;
+  buildPlan(o: { libraryPath: string; destRoot: string; sourceId: string; limit?: number; manifest: ManifestLike; onProgress?: (p: Progress) => void; /** Plain-directory source (CLI --folder) instead of a library bundle. */ folder?: boolean; /** Folder source: explicit file list instead of a walk. */ files?: string[]; log?: (msg: string) => void }): Promise<Plan>;
   savePlan(plan: Plan, home: string): unknown;
   loadPlan(planId: string, home: string): Plan | Promise<Plan>;
   applyPlan(plan: Plan, o: { manifest: ManifestLike; limit?: number; isCancelled?: () => boolean; onProgress?: (p: Progress) => void }): Promise<Record<string, unknown> & { cancelled?: boolean }>;
@@ -75,7 +75,7 @@ export function defaultDeps(home?: string): PhotolibDeps {
       const [{ buildPlan }, { readLibrary }, { readExifBatch }, { resolveTakenDate }, { canonicalPathFor, normalizeExt }] =
         await Promise.all([import('./plan'), import('./rk-reader'), import('./exif'), import('./dates'), import('./layout')]);
       const readFolderSource = async (root: string, ro: { sourceId: string; log?: (m: string) => void }) =>
-        (await import('./folder-reader')).readFolder(root, { sourceId: ro.sourceId, readExifBatch, resolveTakenDate, log: ro.log });
+        (await import('./folder-reader')).readFolder(root, { sourceId: ro.sourceId, readExifBatch, resolveTakenDate, log: ro.log, files: o.files });
       return buildPlan({
         libraryPath: o.libraryPath, destRoot: o.destRoot, sourceId: o.sourceId, limit: o.limit, onProgress: o.onProgress, log: o.log,
         manifest: o.manifest as never, deps: { readLibrary: o.folder ? readFolderSource : readLibrary, readExifBatch, resolveTakenDate, canonicalPathFor, normalizeExt },
