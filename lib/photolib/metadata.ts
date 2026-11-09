@@ -1,6 +1,6 @@
 /**
  * Full-metadata capture (owner rule 2026-11-08: ALL metadata of every ingested file is saved before any move/delete).
- * Per asset, next to the sidecar in HITLOOP-ARCHIVE/timeline/_meta/:
+ * Per asset, next to the sidecar in HITLOOP-ARCHIVE/timeline/_meta/<sha[0:2]>/:
  *   <sha>.exif.json                — complete exiftool dump (every group incl. MakerNotes/XMP/QuickTime/Composite, unknown tags)
  *   <sha>.<xmpSha8>.xmp            — source XMP sidecar(s) found beside the file (e.g. icloudpd --xmp-sidecar), byte copy
  *   <sha>.library.<sourceId>.json  — the source Photos library's full DB record (every ZASSET + ZADDITIONALASSETATTRIBUTES
@@ -13,6 +13,8 @@ import * as path from 'path';
 import type { SidecarMeta } from './types';
 
 export const META_DIR = 'HITLOOP-ARCHIVE/timeline/_meta';
+/** Shard dir for one sha (same rule as the sidecar, see apply.ts defaultSidecarPath). */
+export const metaDirFor = (sha: string) => `${META_DIR}/${sha.slice(0, 2)}`;
 const APPLE_EPOCH = 978307200;
 
 export interface MetaFile {
@@ -61,9 +63,22 @@ export function findXmpSidecars(absPath: string): string[] {
   const base = path.basename(absPath);
   const stem = path.basename(absPath, path.extname(absPath));
   const want = new Set([`${base}.xmp`, `${stem}.xmp`].map(s => s.toLowerCase()));
-  let names: string[];
-  try { names = fs.readdirSync(dir); } catch { return []; }
+  const names = xmpNamesIn(dir);
   return names.filter(n => want.has(n.toLowerCase())).sort().map(n => path.join(dir, n));
+}
+
+/**
+ * .xmp names per directory, listed once per process: a NAS readdir of a 1k-file month folder takes ~11 s, and
+ * capture runs once per file. Sidecars are copied (never moved or deleted) during a run, so the cached list stays true.
+ */
+const xmpDirCache = new Map<string, string[]>();
+function xmpNamesIn(dir: string): string[] {
+  let names = xmpDirCache.get(dir);
+  if (!names) {
+    try { names = fs.readdirSync(dir).filter(n => /\.xmp$/i.test(n)); } catch { names = []; }
+    xmpDirCache.set(dir, names);
+  }
+  return names;
 }
 
 /** Stable JSON: exiftool output minus the fields that describe where the file sits (they change on move). */
@@ -86,7 +101,7 @@ export async function captureMetadata(destRoot: string, f: MetaFile, deps: Captu
   const meta: SidecarMeta = { exif: null, xmp: [], library: [] };
 
   // 1. Full exiftool dump (identical bytes ⇒ identical tags, so one file per sha).
-  const exifRel = `${META_DIR}/${f.sha256}.exif.json`;
+  const exifRel = `${metaDirFor(f.sha256)}/${f.sha256}.exif.json`;
   const dump = normalizeExifDump(await deps.readFullExif(f.absPath));
   const exifAbs = path.join(destRoot, exifRel);
   if (!fs.existsSync(exifAbs)) writeOnce(exifAbs, JSON.stringify({ schema: 'photolib.exif/1', sha256: f.sha256, tags: dump }, null, 2) + '\n');
@@ -95,7 +110,7 @@ export async function captureMetadata(destRoot: string, f: MetaFile, deps: Captu
   // 2. Source XMP sidecars, byte copies keyed by their own content hash (different sources may carry different XMP).
   for (const x of findXmpSidecars(f.absPath)) {
     const buf = fs.readFileSync(x);
-    const rel = `${META_DIR}/${f.sha256}.${sha256Of(buf).slice(0, 8)}.xmp`;
+    const rel = `${metaDirFor(f.sha256)}/${f.sha256}.${sha256Of(buf).slice(0, 8)}.xmp`;
     if (writeOnce(path.join(destRoot, rel), buf) === 'different') throw new Error(`xmp sidecar name collision at ${rel}`);
     meta.xmp.push(rel);
   }
@@ -103,13 +118,13 @@ export async function captureMetadata(destRoot: string, f: MetaFile, deps: Captu
   // 3. Photos library DB record (iCloud downloads).
   if (deps.library) {
     const rec = deps.library.lookup(path.basename(f.absPath), f.sizeBytes, fileCreatedUnix(f.absPath));
-    const rel = `${META_DIR}/${f.sha256}.library.${deps.sourceId}.json`;
+    const rel = `${metaDirFor(f.sha256)}/${f.sha256}.library.${deps.sourceId}.json`;
     const body = JSON.stringify({ schema: 'photolib.library-record/1', sha256: f.sha256, sourceId: deps.sourceId, relativePath: f.relativePath, ...rec }, null, 2) + '\n';
     const abs = path.join(destRoot, rel);
     if (fs.existsSync(abs)) {
       // Same sha from another file of the same source: keep the first record, add this one beside it.
       if (writeOnce(abs, body) === 'different') {
-        const alt = `${META_DIR}/${f.sha256}.library.${deps.sourceId}.${sha256Of(f.relativePath).slice(0, 8)}.json`;
+        const alt = `${metaDirFor(f.sha256)}/${f.sha256}.library.${deps.sourceId}.${sha256Of(f.relativePath).slice(0, 8)}.json`;
         writeOnce(path.join(destRoot, alt), body);
         meta.library.push(alt);
       }

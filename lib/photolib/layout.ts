@@ -46,5 +46,6 @@ export function canonicalPathFor(date: ResolvedDate, sha256: string, ext: string
 
 export function sidecarPathFor(sha256: string): string {
   if (!/^[0-9a-f]{64}$/i.test(sha256)) throw new Error(`bad sha256: ${sha256}`);
-  return `${TIMELINE_ROOT}/_meta/${sha256.toLowerCase()}.json`;
+  const sha = sha256.toLowerCase();
+  return `${TIMELINE_ROOT}/_meta/${sha.slice(0, 2)}/${sha}.json`;
 }

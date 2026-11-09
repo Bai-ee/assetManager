@@ -16,7 +16,11 @@ import { photolibHome } from './manifest';
 import type { AssetRow, Manifest } from './manifest';
 
 export const TIMELINE_ROOT = 'HITLOOP-ARCHIVE/timeline';
-const defaultSidecarPath = (sha: string) => `${TIMELINE_ROOT}/_meta/${sha}.json`;
+/**
+ * New sidecars live in a 2-hex-char shard (`_meta/<sha[0:2]>/<sha>.json`): the WD NAS takes ~1 s per name lookup in a
+ * 10k-entry folder. Assets ingested before 2026-11-08 keep their flat `_meta/<sha>.json` (the manifest records each path).
+ */
+const defaultSidecarPath = (sha: string) => `${TIMELINE_ROOT}/_meta/${sha.slice(0, 2)}/${sha}.json`;
 
 export interface ApplyOptions {
   manifest: Manifest;
@@ -107,7 +111,7 @@ function sweepStaleTemps(plan: Plan, nowMs: number): void {
   const dirs = new Set<string>();
   const add = (rel: string) => { try { dirs.add(path.dirname(assertSafeDest(plan.destRoot, rel))); } catch { /* unsafe path: ignore */ } };
   for (const pi of plan.items) { add(pi.canonicalPath); for (const c of pi.children) add(c.canonicalPath); }
-  add(defaultSidecarPath('x'));
+  for (const pi of plan.items) add(defaultSidecarPath(pi.sha256));
   for (const d of Array.from(dirs)) {
     let names: string[];
     try { names = fs.readdirSync(d); } catch { continue; }

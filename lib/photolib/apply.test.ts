@@ -13,7 +13,7 @@ const open = () => new Manifest(path.join(tmpDir(), 'm.sqlite'));
 const plan = (fx: Fixture, m: Manifest, limit?: number): Promise<Plan> =>
   buildPlan({ libraryPath: fx.libAbs, destRoot: fx.root, sourceId: 'photos-test', manifest: m, deps: fx.deps, limit });
 const timeline = (fx: Fixture) => listFiles(path.join(fx.root, 'HITLOOP-ARCHIVE'));
-const sidecarOf = (fx: Fixture, c: string) => JSON.parse(fs.readFileSync(path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha(c)}.json`), 'utf8')) as Sidecar;
+const sidecarOf = (fx: Fixture, c: string) => JSON.parse(fs.readFileSync(path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha(c).slice(0, 2)}/${sha(c)}.json`), 'utf8')) as Sidecar;
 
 test('apply: copies, verifies, writes sidecar + manifest, never touches the library bundle', async () => {
   const fx = makeFixture([
@@ -136,7 +136,7 @@ test('undo: sidecar with locations from another source is kept', async () => {
   const fx = makeFixture([{ rel: 'Masters/a.JPG', content: 'AAA' }]);
   const m = open();
   const r = await applyPlan(await plan(fx, m), { manifest: m });
-  const sp = path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha('AAA')}.json`);
+  const sp = path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha('AAA').slice(0, 2)}/${sha('AAA')}.json`);
   const sc = JSON.parse(fs.readFileSync(sp, 'utf8')) as Sidecar;
   sc.locations.push({ ...sc.locations[0], sourceId: 'other', relativePath: 'x.jpg' });
   fs.writeFileSync(sp, JSON.stringify(sc));

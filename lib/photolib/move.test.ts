@@ -34,7 +34,7 @@ function recorder() {
   return { calls, captureMeta };
 }
 const raw = (fx: Fixture, rel: string) => path.join(fx.libAbs, rel);
-const sidecarOf = (fx: Fixture, c: string) => JSON.parse(fs.readFileSync(path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha(c)}.json`), 'utf8')) as Sidecar;
+const sidecarOf = (fx: Fixture, c: string) => JSON.parse(fs.readFileSync(path.join(fx.root, `HITLOOP-ARCHIVE/timeline/_meta/${sha(c).slice(0, 2)}/${sha(c)}.json`), 'utf8')) as Sidecar;
 
 test('move: captures metadata first, renames new files into the timeline, verifies, journals srcPath', async () => {
   const fx = folderFixture([

@@ -43,7 +43,7 @@ test('canonicalPathFor rejects bad input', () => {
 });
 
 test('sidecarPathFor', () => {
-  assert.equal(sidecarPathFor(SHA), `HITLOOP-ARCHIVE/timeline/_meta/${SHA}.json`);
+  assert.equal(sidecarPathFor(SHA), `HITLOOP-ARCHIVE/timeline/_meta/${SHA.slice(0, 2)}/${SHA}.json`);
   assert.throws(() => sidecarPathFor('abc'));
 });
 
