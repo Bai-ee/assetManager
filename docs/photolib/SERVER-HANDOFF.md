@@ -169,16 +169,51 @@ cd ~/Documents/Repos/assetManager-photolib
 nohup zsh scripts/photolib/icloud-all.sh 2020 > ~/.photolib/logs/icloud-all.nohup 2>&1 &
 ```
 
-Each year runs `scripts/photolib/icloud-year.sh <y> <y+1>`: download (icloudpd, originals + Live Photo videos + XMP
-sidecars into `bryan/iCloud-Photos/YYYY/MM`) → plan (camera-only, whole iCloud-Photos root, source id
-`folder-icloud-photos`) → apply `--mode move --photos-db` (metadata capture, verified move, verified raw-dup delete) →
-thumbs → push → verify. It stops the whole run at the first failed batch so nothing runs out of order.
+Each year runs `scripts/photolib/icloud-year.sh <y> <y+1>` (the interface `icloud-all.sh` calls; unchanged). Since
+the monthly-chunk change (branch `feat/photolib-monthly`) the year is processed as month windows, oldest first. Per month:
+download (icloudpd with `--skip-created-before YYYY-MM-01 --skip-created-after <next month>-01`, originals + Live Photo
+videos + XMP sidecars into `bryan/iCloud-Photos/YYYY/MM`) → plan (camera-only, source id `folder-icloud-photos`, only
+that month's folder through `--files`, so `relativePath` stays relative to the iCloud-Photos root) → apply
+`--mode move --photos-db` (metadata capture, verified move, verified raw-dup delete) → thumbs → push → verify. Every
+month is pushed before the next starts, so the timeline fills in month by month. After December a `YYYY-sweep` window
+plans the whole year folder once (catches a file icloudpd filed under a neighbouring month directory at a month edge;
+a no-op when nothing new). The run stops at the first failed step so nothing runs out of order. The batch that was
+already running when this landed (2020) finishes the old way (one whole-year pass); monthly starts with the next year
+after the checkout is fast-forwarded.
+
+Month log lines in `icloud-run-<y>-<y+1>.log`: `=== month YYYY-MM ===` opens a month, then the usual step lines
+(`ok download`, `plan: planId …`, `ok apply`, `apply {…}`, `ok thumbs`, `ok push`, `verify: {…}`), then `done YYYY-MM`.
+Empty months log `no files in YYYY-MM, nothing to plan`. Optional env: `DOWNLOAD_SCOPE=year` downloads the whole year
+once up front (each icloudpd window re-scans the whole library, about 8 min per window; the default is per month).
 
 Report every 5 minutes (a `sleep 300` background timer, then read the logs):
 
 - `~/.photolib/logs/icloud-all.log` (batch start/finish/STOPPED)
 - `~/.photolib/logs/icloud-run-<y>-<y+1>.log` (step lines start with a date; progress lines are `n/total`)
 - free disk: `df -h /`
+- `~/.photolib/status.json`, written every 5 minutes by the heartbeat (below); `jq . ~/.photolib/status.json`
+
+### Heartbeat and status.json
+
+`scripts/photolib/heartbeat.sh` (runs `heartbeat.mts`) builds the public `life.status/1` document from RUN_ENABLED,
+`icloud-all.log`, the newest `icloud-run-*.log`, the manifest (readonly), `pmset`, `df`, `mount`, port 3005 and `pgrep`,
+writes it to `~/.photolib/status.json` and POSTs it to `${LIFE_STATUS_URL:-https://life.hitloop.agency}/api/archive/worker/life/status`
+(bearer `HITLOOP_ARCHIVE_WORKER_TOKEN` from the repo `.env.local`). It never touches the NAS beyond `mount`, and the
+document holds no paths, file names or account names. A failed POST is one line in `~/.photolib/logs/heartbeat.log`;
+status.json is still written. launchd agent `com.bballi.photolib.heartbeat` (plist in `~/server/launchd`, every 300 s):
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/server/launchd/com.bballi.photolib.heartbeat.plist
+launchctl print gui/$(id -u)/com.bballi.photolib.heartbeat | head   # check
+zsh ~/Documents/Repos/assetManager-photolib/scripts/photolib/heartbeat.sh   # run once by hand
+```
+
+Reading status.json: `run.state` running/stopped/done/idle (idle = no `icloud-all.sh` process), `run.batch` the year or
+month (`2021-03`), `run.step` download/plan/apply/thumbs/push/verify with `stepStartedAt`, `run.error` a short reason when
+stopped. `progress.batchesDone/Total/Remaining` count years until monthly mode shows up in the logs, months after.
+`itemsPerMin` is the manifest `assets` growth over the last 3 h (null under 10 min of history or no growth);
+`etaFinishAt` is the average wall time of the finished batches of this run times the batches left (null until one
+batch has finished). `_samples` is a private array for the rate and is not posted.
 
 Approximate rates on the old Mac: plan hashing ~140 items/min, apply ~30–140 items/min, thumbs ~70 items/min.
 
@@ -186,8 +221,10 @@ Approximate rates on the old Mac: plan hashing ~140 items/min, apply ~30–140 i
 
 | Symptom | Do |
 |---|---|
-| `STOPPED at <y>` in icloud-all.log | Read the year log's last lines. Fix the cause, then `zsh scripts/photolib/icloud-all.sh <y>`. Download, plan, apply are all idempotent. |
-| Apply interrupted after a good plan | Resume without re-hashing: `REUSE_PLAN=<planId> zsh scripts/photolib/icloud-year.sh <y> <y+1> --no-download`, then `icloud-all.sh <y+1>`. Files already moved show as "File not found" errors in the rerun; that is expected (check the journal: `select count(*) from journal where src_path like 'iCloud-Photos/<y>/%'`). |
+| `STOPPED at <y>` in icloud-all.log | Read the year log's last lines (`=== month YYYY-MM ===` says which month failed; `status.json` shows `run.stoppedAt` and `run.error`). Fix the cause, then `zsh scripts/photolib/icloud-all.sh <y>`. Download, plan, apply are all idempotent, and months with a `done YYYY-MM` line are skipped, so it resumes at the failed month. |
+| Resume one month by hand | `zsh scripts/photolib/icloud-year.sh <y> <y+1>` continues at the first month without a `done` line. To force a month again, delete its `done YYYY-MM` line from the year log (or move the log aside; every step is idempotent). |
+| status.json stale or the status page says "stale" | Heartbeat agent not running: `launchctl print gui/$(id -u)/com.bballi.photolib.heartbeat`, then `cat ~/server/logs/heartbeat.err.log ~/.photolib/logs/heartbeat.log`. A `POST failed` line only means the page did not get the update; status.json is still fresh. |
+| Apply interrupted after a good plan | Resume without re-hashing (applies the plan to the first month that is not done): `REUSE_PLAN=<planId> zsh scripts/photolib/icloud-year.sh <y> <y+1> --no-download`, then `icloud-all.sh <y+1>`. Files already moved show as "File not found" errors in the rerun; that is expected (check the journal: `select count(*) from journal where src_path like 'iCloud-Photos/<y>/%'`). |
 | Plan contains `hash failed: ENOTCONN` | The NAS dropped mid-hash. The script refuses to apply it; rerun the year. |
 | Process stuck in state `U` with 0% CPU | NAS I/O stall. Check `stat /Volumes/bryan/HITLOOP-ARCHIVE/timeline` speed; wait or remount. Never start a second NAS job "to test". |
 | Disk filling up | Each interrupted apply leaves a ~3 GB `photosdb-*` folder in `$TMPDIR`. Delete the ones no process holds open (`lsof +D <dir>` empty). |
@@ -195,7 +232,7 @@ Approximate rates on the old Mac: plan hashing ~140 items/min, apply ~30–140 i
 
 ### After each year
 
-The script's last log line is `verify: {...}` with `unpushed: 0, noThumb: 0`. Tell the owner the year's count, how
+The last month's `verify: {...}` line (before `=== done <y>..<y> ===`) must show `unpushed: 0, noThumb: 0`. Tell the owner the year's count, how
 many raw duplicates were deleted, and how many non-camera items stayed in the raw backup.
 
 ## 10. After 2026 is done
