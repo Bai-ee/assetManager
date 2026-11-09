@@ -36,8 +36,9 @@ server; JPEG thumbs go to private Storage `life-thumbs/`.
    tell them to change the password and never repeat it.
 6. **One NAS write job at a time.** The WD NAS drops the SMB share under parallel load (ENOTCONN). Never run two
    photolib commands, a big copy, or an `ls` of a huge NAS folder alongside a running batch.
-7. Push only to the LOCAL dev server (`HITLOOP_ARCHIVE_CONTROL_URL=http://localhost:3005`). No deploys, no Vercel env
-   changes, no Firestore rules deploys, no paid API calls without the owner's OK.
+7. The photolib ingest pushes its index to the LOCAL dev server (`HITLOOP_ARCHIVE_CONTROL_URL=http://localhost:3005`).
+   The HITLOOP harness on this machine runs with the owner's full `.env.local` and full privileges: all of its
+   functions and integrations (paid APIs included) are meant to be active here.
 8. Personal scope only: never touch `x_content_packages`, `timeline_entries`, buckets, the Brain, or the content agent.
 9. Never write inside a photo library bundle (`*.photoslibrary`, `iPhoto Library`). Never delete single files inside one.
 10. Skip the libraries and folders the private handoff lists as excluded (another person's material).
@@ -86,9 +87,11 @@ Ask the owner to copy these two files over a private channel (AirDrop, password 
 
 - `assetManager-photolib/.env.local`: `HITLOOP_ARCHIVE_CONTROL_URL`, `HITLOOP_ARCHIVE_WORKER_TOKEN`,
   `HITLOOP_ARCHIVE_WORKER_ID` (the other keys in that file are for unrelated pipelines and can be left out).
-- `Bballi_Portfolio-life-timeline/.env.local`: `NEXT_PUBLIC_FIREBASE_*`, `FIREBASE_ADMIN_PROJECT_ID`,
+- `Bballi_Portfolio-life-timeline/.env.local`: the owner's **full** HITLOOP env file, unchanged; do not trim it.
+  The life timeline needs at least `NEXT_PUBLIC_FIREBASE_*`, `FIREBASE_ADMIN_PROJECT_ID`,
   `FIREBASE_ADMIN_CLIENT_EMAIL`, `FIREBASE_ADMIN_PRIVATE_KEY`, `FIREBASE_ADMIN_STORAGE_BUCKET`,
-  `HITLOOP_ARCHIVE_WORKER_TOKEN` (same value as the worker's), `LIFE_OWNER_UIDS`.
+  `HITLOOP_ARCHIVE_WORKER_TOKEN` (same value as the worker's), and `LIFE_OWNER_UIDS`. Every other key stays so the
+  rest of the HITLOOP harness works on this machine.
 
 `chmod 600` both files.
 
