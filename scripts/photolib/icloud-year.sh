@@ -16,8 +16,12 @@
 #   the year log is skipped on rerun, so a rerun resumes at the first unfinished month. Any failed step fails the year.
 #   The sweep (`YYYY-sweep`) plans the whole year folder once to catch files icloudpd filed under a neighbouring month
 #   directory (UTC vs local day at a month edge); it is a cheap no-op when nothing new turns up.
-# Env DOWNLOAD_SCOPE=year downloads the whole year once up front (icloudpd re-scans the entire library for every
-#   window, ~8 min each) and the month loop then only plans/applies/pushes; default is month.
+# DOWNLOAD SCOPE: every icloudpd window walks the whole library newest-first (~31 min of skipping each for a 75,771-item library), so downloads
+#   are batched. Scope = month | quarter | year; quarter (default) downloads a whole quarter per window and
+#   the other months of it only plan/apply/thumbs/push. Re-read at the start of EVERY month from ~/.photolib/DOWNLOAD_SCOPE
+#   (one word), else env DOWNLOAD_SCOPE, else quarter, so it can be changed mid-run. A restart in the middle of a window
+#   uses the year log: each download logs `downloaded-window A..B`, and a month is only downloaded when no such window (or old-style
+#   `downloaded YYYY-MM:` line) covers it. Window = [this month, next quarter start) for quarter, next month for month, next January for year.
 # Test hooks (defaults are the real paths): PHOTOLIB_ICLOUD_ROOT, PHOTOLIB_NAS_MOUNT.
 set -u
 [ -f $HOME/.photolib/env ] && source $HOME/.photolib/env
@@ -57,7 +61,7 @@ cd $REPO || exit 1
 download() { # download <from YYYY-MM-DD> <toExclusive YYYY-MM-DD>
   retry download caffeinate -is icloudpd --username $PHOTOLIB_APPLE_ID --directory $ROOT \
     --folder-structure '{:%Y/%m}' --size original --live-photo-size original --live-photo-mov-filename-policy original \
-    --xmp-sidecar --skip-created-before $1 --skip-created-after $2 --no-progress-bar
+    --xmp-sidecar --skip-created-before $1 --skip-created-after $2 --no-progress-bar && log "downloaded-window $1..$2"
 }
 
 # process <label> <dir to list (month or year folder)> <download from> <download to or "">
@@ -89,19 +93,45 @@ process() {
 }
 
 is_done() { grep -q " done $1\$" $LOG 2>/dev/null; }
+# Download scope, re-read at the start of EVERY month: ~/.photolib/DOWNLOAD_SCOPE (month|quarter|year), else env
+# DOWNLOAD_SCOPE, else quarter. Lets the owner change it mid-run by writing the file.
+read_scope() {
+  local v=""
+  [ -f $HOME/.photolib/DOWNLOAD_SCOPE ] && v=$(head -1 $HOME/.photolib/DOWNLOAD_SCOPE | tr -d '[:space:]')
+  [ -n "$v" ] || v=${DOWNLOAD_SCOPE:-}
+  case "$v" in month|quarter|year) print -r -- $v;; *) print -r -- quarter;; esac
+}
+idx_label() { printf '%04d-%02d' $(($1 / 12)) $(($1 % 12 + 1)); }   # month index (y*12+m-1) -> YYYY-MM
+# Is month YYYY-MM already covered by a download in this year log? (`downloaded-window A..B` with A <= YYYY-MM-01 < B,
+# or the single-month line `downloaded YYYY-MM:` that the old per-month script logged.)
+covered() {
+  local d=$1-01 a b w
+  grep -q " downloaded $1:" $LOG 2>/dev/null && return 0
+  for w in $(grep -o 'downloaded-window [0-9-]*\.\.[0-9-]*' $LOG 2>/dev/null | cut -d' ' -f2); do
+    a=${w%%..*}; b=${w##*..}
+    [[ ! "$d" < "$a" && "$d" < "$b" ]] && return 0
+  done
+  return 1
+}
 NOW_YM=$(date '+%Y-%m')
 for y in $(seq $FROM $((TO-1))); do
-  if [ "${DOWNLOAD_SCOPE:-month}" = "year" ] && [ "$NODL" != "--no-download" ]; then
-    is_done $y-12 && is_done $y-sweep || download $y-01-01 $((y+1))-01-01 || exit 1
-  fi
   for m in 01 02 03 04 05 06 07 08 09 10 11 12; do
     label=$y-$m
     is_done $label && continue
     [[ "$label" > "$NOW_YM" ]] && continue   # future month: nothing to ingest yet
-    nm=$((10#$m + 1)); ny=$y; [ $nm -eq 13 ] && { nm=1; ny=$((y+1)); }
     log "=== month $label ==="
-    if [ "${DOWNLOAD_SCOPE:-month}" = "year" ]; then DLTO=""; else DLTO=$ny-$(printf %02d $nm)-01; fi
-    process $label $ROOT/$y/$m $label-01 "$DLTO" || exit 1
+    SCOPE=$(read_scope)
+    mi=$((y * 12 + 10#$m - 1))
+    case $SCOPE in   # window = [this month, end): month -> next month; quarter -> next quarter start; year -> next January
+      month) end=$((mi + 1));;
+      quarter) end=$((mi - (10#$m - 1) % 3 + 3));;
+      year) end=$(((y + 1) * 12));;
+    esac
+    DLFROM=$label-01; DLTO=$(idx_label $end)-01
+    if [ "$NODL" = "--no-download" ] || covered $label; then
+      DLFROM=""; DLTO=""; log "download scope $SCOPE: none (covered by an earlier window)"
+    else log "download scope $SCOPE: $DLFROM .. $DLTO"; fi
+    process $label $ROOT/$y/$m "$DLFROM" "$DLTO" || exit 1
     log "done $label"
   done
   if ! is_done $y-sweep; then

@@ -101,6 +101,11 @@ export function countDownloaded(text: string, startedAtMs: number | null): numbe
   while ((m = hdrRe.exec(text))) from = m.index; // start of the LAST header
   re.lastIndex = from;
   while ((m = re.exec(text))) n++;
+  // Quarter/year download scope: the month's files were downloaded in an earlier section, so also honour the
+  // folder file count the script logs ("downloaded <label>: N files") for this section.
+  const folder = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} downloaded \S+: (\d+) files/gm;
+  folder.lastIndex = from;
+  while ((m = folder.exec(text))) n = Math.max(n, Number(m[1]));
   void startedAtMs;
   return n;
 }

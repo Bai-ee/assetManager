@@ -183,8 +183,18 @@ after the checkout is fast-forwarded.
 
 Month log lines in `icloud-run-<y>-<y+1>.log`: `=== month YYYY-MM ===` opens a month, then the usual step lines
 (`ok download`, `plan: planId …`, `ok apply`, `apply {…}`, `ok thumbs`, `ok push`, `verify: {…}`), then `done YYYY-MM`.
-Empty months log `no files in YYYY-MM, nothing to plan`. Optional env: `DOWNLOAD_SCOPE=year` downloads the whole year
-once up front (each icloudpd window re-scans the whole library, about 8 min per window; the default is per month).
+Empty months log `no files in YYYY-MM, nothing to plan`.
+
+Download scope. Every icloudpd window walks the whole library newest-first (75,771 items, about 31 min of pure
+skipping per window), so one window per month would cost about 40 h over the project. The download is therefore
+batched: scope `quarter` (default) downloads `[this month, next quarter start)`, `month` downloads `[this month, next month)`,
+`year` downloads `[this month, next January)`. Each month iteration downloads only when the year log has no
+`downloaded-window A..B` line covering it (written after a successful download; an old-style `downloaded YYYY-MM:` line
+covers that one month), so the rest of the window just runs plan/apply/thumbs/push (`download scope quarter: none (covered…)`).
+A restart anywhere resumes correctly because coverage comes from the log. The scope is re-read at the start of every month
+from `~/.photolib/DOWNLOAD_SCOPE` (one word: `month`, `quarter` or `year`), else env `DOWNLOAD_SCOPE`, else `quarter`, so
+the owner can change it mid-run: `echo month > ~/.photolib/DOWNLOAD_SCOPE`. The first real monthly cycle (2020-01) ran end to
+end under the month-per-window script.
 
 Report every 5 minutes (a `sleep 300` background timer, then read the logs):
 
@@ -222,6 +232,7 @@ Approximate rates on the old Mac: plan hashing ~140 items/min, apply ~30–140 i
 | Symptom | Do |
 |---|---|
 | `STOPPED at <y>` in icloud-all.log | Read the year log's last lines (`=== month YYYY-MM ===` says which month failed; `status.json` shows `run.stoppedAt` and `run.error`). Fix the cause, then `zsh scripts/photolib/icloud-all.sh <y>`. Download, plan, apply are all idempotent, and months with a `done YYYY-MM` line are skipped, so it resumes at the failed month. |
+| Download window does not cover a month you expect (files missing) | Check `grep -E 'downloaded-window|download scope' <year log>`. Delete the covering `downloaded-window` line (or the month's `downloaded YYYY-MM:` line) from the log to force that month to download again, or set `echo month > ~/.photolib/DOWNLOAD_SCOPE`. |
 | Resume one month by hand | `zsh scripts/photolib/icloud-year.sh <y> <y+1>` continues at the first month without a `done` line. To force a month again, delete its `done YYYY-MM` line from the year log (or move the log aside; every step is idempotent). |
 | status.json stale or the status page says "stale" | Heartbeat agent not running: `launchctl print gui/$(id -u)/com.bballi.photolib.heartbeat`, then `cat ~/server/logs/heartbeat.err.log ~/.photolib/logs/heartbeat.log`. A `POST failed` line only means the page did not get the update; status.json is still fresh. |
 | Apply interrupted after a good plan | Resume without re-hashing (applies the plan to the first month that is not done): `REUSE_PLAN=<planId> zsh scripts/photolib/icloud-year.sh <y> <y+1> --no-download`, then `icloud-all.sh <y+1>`. Files already moved show as "File not found" errors in the rerun; that is expected (check the journal: `select count(*) from journal where src_path like 'iCloud-Photos/<y>/%'`). |

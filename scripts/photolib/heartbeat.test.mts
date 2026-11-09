@@ -40,6 +40,11 @@ test('countDownloaded counts only after the last header', () => {
   assert.equal(countDownloaded(t, null), 2);
 });
 
+test('countDownloaded uses the folder file count when a month was downloaded earlier (quarter scope)', () => {
+  const t = ['2026-11-09 12:00:00 === month 2021-02 ===', '2026-11-09 12:00:01 ok download', '2026-11-09 12:00:02 downloaded 2021-02: 17 files, 1G'].join('\n');
+  assert.equal(countDownloaded(t, null), 17);
+});
+
 test('clean strips paths, file names and e-mail', () => {
   const c = clean('FAIL: PHOTOLIB_PHOTOS_DB not found: /Users/x/Photos.sqlite for me@example.com IMG_0001.HEIC ok');
   assert.ok(!c.includes('/') && !c.includes('@') && !/IMG_0001/.test(c) && !/Photos\.sqlite/.test(c));
