@@ -254,3 +254,9 @@ export function copyPhotosDb(photosSqlite: string, tmpRoot: string): string {
   }
   return path.join(dir, path.basename(photosSqlite));
 }
+
+/** Remove the temp dir made by copyPhotosDb (only a directory named photosdb-*; anything else is left alone). */
+export function removePhotosDbCopy(copyPath: string): void {
+  const dir = path.dirname(copyPath);
+  if (path.basename(dir).startsWith('photosdb-')) fs.rmSync(dir, { recursive: true, force: true });
+}

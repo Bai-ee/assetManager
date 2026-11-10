@@ -5,7 +5,7 @@ import * as path from 'path';
 import { Manifest } from './manifest';
 import { buildPlan } from './plan';
 import { applyPlan, undoRun } from './apply';
-import { captureMetadata, findXmpSidecars, nameKeys, normalizeExifDump, openLibraryRecordIndex, writeOnce } from './metadata';
+import { captureMetadata, findXmpSidecars, nameKeys, normalizeExifDump, openLibraryRecordIndex, removePhotosDbCopy, copyPhotosDb, writeOnce } from './metadata';
 import { makeFixture, sha, tmpDir, type Fixture } from './test-fixtures';
 import type { Plan, Sidecar, SidecarMeta } from './types';
 import type { MetaFile } from './metadata';
@@ -178,4 +178,17 @@ test('move: refused for an external (ext:) folder source', async () => {
   await assert.rejects(applyPlan(p, { manifest: m, mode: 'move', captureMeta: recorder().captureMeta }), /must be inside destRoot/);
   assert.equal(fs.readFileSync(raw(fx, 'a.JPG'), 'utf8'), 'AAA');
   m.close();
+});
+
+test('removePhotosDbCopy deletes the photosdb-* temp dir and only that', () => {
+  const root = tmpDir();
+  const src = path.join(root, 'Photos.sqlite'); fs.writeFileSync(src, 'x');
+  const copy = copyPhotosDb(src, root);
+  assert.ok(fs.existsSync(copy));
+  removePhotosDbCopy(copy);
+  assert.ok(!fs.existsSync(path.dirname(copy)));
+  assert.ok(fs.existsSync(src));
+  removePhotosDbCopy(src); // not a photosdb-* dir: untouched
+  assert.ok(fs.existsSync(src));
+  fs.rmSync(root, { recursive: true, force: true });
 });

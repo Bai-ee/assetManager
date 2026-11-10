@@ -191,13 +191,15 @@ export async function main(argv: string[]): Promise<number> {
           plan = await deps.loadPlan(args.plan, home);
         } else plan = await planNow();
         if (cancelled) { result = { cancelled: true }; break; }
-        const [{ captureMetadata, openLibraryRecordIndex, copyPhotosDb }, { readFullExif }, os] = await Promise.all([import('./metadata'), import('./exif'), import('node:os')]);
-        const library = args.photosDb ? openLibraryRecordIndex(copyPhotosDb(args.photosDb, os.tmpdir())) : null;
+        const [{ captureMetadata, openLibraryRecordIndex, copyPhotosDb, removePhotosDbCopy }, { readFullExif }, os] = await Promise.all([import('./metadata'), import('./exif'), import('node:os')]);
+        const dbCopy = args.photosDb ? copyPhotosDb(args.photosDb, os.tmpdir()) : null;
+        let library: ReturnType<typeof openLibraryRecordIndex> | null = null;
         try {
+          library = dbCopy ? openLibraryRecordIndex(dbCopy) : null;
           const destRoot = resolve(plan.destRoot);
           const captureMeta = (f: Parameters<typeof captureMetadata>[1]) => captureMetadata(destRoot, f, { readFullExif, library, sourceId: plan.sourceId });
           result = await deps.applyPlan(plan, { manifest, limit: args.limit, isCancelled, onProgress, mode: args.mode, captureMeta } as never);
-        } finally { library?.close(); }
+        } finally { try { library?.close(); } finally { if (dbCopy) removePhotosDbCopy(dbCopy); } }
         line(args, `apply ${JSON.stringify(result)}`);
         break;
       }
